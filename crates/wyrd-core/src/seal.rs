@@ -71,6 +71,47 @@ pub fn seal(
     }
 }
 
+/// Parses a manifest from its stored form: the canonical text plus a
+/// final `manifest_sha256=` line. The embedded hash is checked against
+/// the canonical body before any field is trusted, so a manifest edited
+/// after sealing fails here rather than at file comparison time.
+pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
+    let Some((body, claimed)) = text.rsplit_once("manifest_sha256=") else {
+        return Err("manifest has no manifest_sha256 line".into());
+    };
+    let claimed = claimed.trim();
+    if sha256_hex(body.as_bytes()) != claimed {
+        return Err("manifest hash does not match its body".into());
+    }
+    let mut experiment = None;
+    let mut spec_version = None;
+    let mut generator_version = None;
+    let mut seed = None;
+    let mut file_hashes = BTreeMap::new();
+    for line in body.lines() {
+        if let Some((name, hash)) = line.strip_prefix("file:").and_then(|r| r.split_once('=')) {
+            file_hashes.insert(name.to_string(), hash.to_string());
+        } else if let Some((k, v)) = line.split_once('=') {
+            match k {
+                "experiment" => experiment = Some(v.to_string()),
+                "spec_version" => spec_version = Some(v.to_string()),
+                "generator_version" => generator_version = Some(v.to_string()),
+                "seed" => seed = Some(v.parse().map_err(|_| "seed is not a number".to_string())?),
+                other => return Err(format!("unknown manifest field: {other}")),
+            }
+        } else {
+            return Err(format!("malformed manifest line: {line}"));
+        }
+    }
+    Ok(Manifest {
+        experiment: experiment.ok_or("manifest missing experiment")?,
+        spec_version: spec_version.ok_or("manifest missing spec_version")?,
+        generator_version: generator_version.ok_or("manifest missing generator_version")?,
+        seed: seed.ok_or("manifest missing seed")?,
+        file_hashes,
+    })
+}
+
 /// Why a verification failed. Every variant is a charter void, not a
 /// warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +120,18 @@ pub enum VerifyError {
     ExtraFile(String),
     HashMismatch(String),
 }
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyError::MissingFile(n) => write!(f, "sealed file is missing: {n}"),
+            VerifyError::ExtraFile(n) => write!(f, "unsealed extra file present: {n}"),
+            VerifyError::HashMismatch(n) => write!(f, "file changed since sealing: {n}"),
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
 
 /// Verifies files against a manifest. All files in the manifest must be
 /// present with matching hashes, and no extra files may be present.
