@@ -1,0 +1,11 @@
+[package]
+name = "wyrd-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "wyrd"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-core = { path = "../wyrd-core" }
