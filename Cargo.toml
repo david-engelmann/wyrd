@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/wyrd-core"]
+
+[workspace.package]
+edition = "2021"
+# Licence intentionally unset. Charter section 12, decision 2 is still open.
+
+[profile.dev]
+# This box is small. Keep dev builds light.
+debug = 1
