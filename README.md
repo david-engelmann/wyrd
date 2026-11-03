@@ -14,13 +14,13 @@ Wyrd extends that question to the stages and behaviours the anchor left open. It
 
 ## How wyrd works
 
-Every experiment runs paired arms on the same base. One arm stays clean and one arm carries planted threads and a matched sham arm carries benign threads of the same size and shape. Attack success is defined in writing before any run. A case counts only when the poisoned arm shows the target behaviour and the clean arm does not and base capability stays within a stated tolerance. Case sets and poison sets are sealed under a hashed manifest before a run and they never change afterward. Every rate carries a confidence interval. Results publish as they complete and every published number is derived from the sealed data.
+Every experiment is designed to run paired arms on the same base. One arm stays clean and one arm carries planted threads and a matched sham arm carries benign threads of the same size and shape. Attack success is defined in writing before any run. A case counts only when the poisoned arm shows the target behaviour and the clean arm does not and base capability stays within a stated tolerance. Case sets and poison sets are sealed under a hashed manifest before a run and they never change afterward. Every rate carries a confidence interval. Results are designed to publish as they complete and every published number is derived from the sealed data.
 
 Wyrd stands in the peira tradition. Peira measures what attacks do to a finished model at inference time. Wyrd measures what planted threads do to a model before inference ever begins.
 
 ## Status
 
-Wyrd is in its charter phase. The design charter in this repository sets out the taxonomy and the metrics and the arm definitions and the substrate plan and the cost model. Experiment code comes after the charter passes its review checkpoint. The first arms to run need no training at all. They cover retrieval corpora and graphs and they run on corpus construction plus live model calls.
+Wyrd is in its charter phase. The design charter in this repository sets out the taxonomy and the metrics and the arm definitions and the substrate plan and the cost model. Experiment code comes after the charter passes its review checkpoint. The first arms to run are the retrieval and GraphRAG arms and they need no model training at all. They run on corpus construction plus live model calls. The graph arm also carries a small graph neural network cell and that one trains a small model in Rust as part of the measurement.
 
 ## Language
 
