@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/wyrd-core"]
+members = [
+    "crates/wyrd-cli",
+    "crates/wyrd-core",
+    "crates/wyrd-corpus",
+    "crates/wyrd-eval",
+    "crates/wyrd-graph",
+    "crates/wyrd-providers",
+    "crates/wyrd-publish",
+    "crates/wyrd-retrieve",
+]
 
 [workspace.package]
 edition = "2021"
