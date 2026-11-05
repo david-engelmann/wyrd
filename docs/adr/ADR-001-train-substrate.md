@@ -1,9 +1,7 @@
 # ADR-001: Train substrate after the candle spike
 
-Status: proposed, awaiting David's decision (the options trade his
-money and his standing compute ruling against schedule, which makes
-the call his; everything else in Phase 0 and Phase 1 proceeds without
-it).
+Status: DECIDED 2026-11-05, under David's delegation in the main
+chat ("Make the best decisions"). Decision below.
 
 ## Context
 
@@ -61,10 +59,25 @@ that still reads as a dose-response experiment (at least four doses
 and at least two seeds), because past that point the local path is
 not slow, it is absent.
 
+## Decision (2026-11-05)
+
+The recommendation is adopted. The path is C then A: optimise the
+local candle path first (the spike attempted none of the obvious
+speedups), re-spike, and size the PRE-001 regime from the measured
+rate. Option B, the external GPU trainer, is held in reserve only. It
+is not approved, and this decision authorises no spend and no
+reopening of rented compute for wyrd's scope. If the re-spike reaches
+the reserve trigger named in the recommendation, B returns as a fresh
+decision for David, not as an automatic escalation. The train crate
+may now be built for the optimisation work; PRE-001's spec still
+cannot seal until the re-spike prints its measured rate and ladder
+projection.
+
 ## Consequences either way
 
-- The train crate is not built until this ADR is decided. The charter
-  language ledger records that as the spike outcome.
+- The train crate was not built while this ADR was undecided. With
+  the decision recorded above, it may be built for the optimisation
+  and re-spike work.
 - Phase 1 (RAG and graph arms) is unaffected and proceeds.
 - PRE-001's spec cannot seal until the chosen path re-measures its
   rate and prints its projection, per the charter.
