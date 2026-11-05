@@ -360,13 +360,13 @@ Starting line share target: 100 percent Rust code at end of Phase 0, and no phas
 ## 12. Open decisions for charter review
 
 1. Name. DECIDED 2026-11-03: wyrd. Repo david-engelmann/wyrd is created and seeded. Closed.
-2. Licence for wyrd itself. Not yet chosen, and it must be chosen before the first experiment code lands, because contributors and reusers will assume one. Recommendation: Apache-2.0 for the code (patent grant matters for a benchmark others may build tooling on), with case and poison data under CC BY 4.0 where we hold the rights. David to confirm or pick MIT instead.
-3. Training engine. Option A (candle) recommended, spike first. Needs approval as the Phase 0 plan.
+2. Licence for wyrd itself. DECIDED 2026-11-05 under David's delegation ("Make the best decisions"): Apache-2.0 for the code, with case and poison data under CC BY 4.0 where we hold the rights. The workspace Cargo.toml carries the Apache-2.0 declaration and the repo carries the licence texts. Closed.
+3. Training engine. DECIDED through ADR-001 (decided 2026-11-05, same delegation): candle is the substrate, the first spike failed its bar as measured, and the path is to optimise the local candle path, re-spike, and size the PRE-001 regime from the measured rate. The external GPU trainer stays in reserve and is not approved; no spend is authorised. Closed.
 4. First QA corpus licence for RAG-001. Recommendation: build v1 from a permissively licensed open QA set and record the licence in the corpus manifest, with the synthetic GRA-001 corpus carrying the earliest publishable result if licensing review drags.
 5. Publication line for sensitive poison sets. DECIDED in principle at the v0.4 review pass, on the red team's objection that hashes plus seeds are not access control: canary and denial-of-service payloads publish in full, guardrail-bypass and code-payload generators are access-gated with output hashes published. Section 9 carries the policy. David may tighten it, and any change is a charter amendment, not a per-result judgement.
 6. Success threshold default for N-min (section 4). The stated default is a recommendation, open to tightening at review.
 7. Whether Phase 1 models beyond Anthropic are in scope for the first curve, or whether RAG-001 publishes single-provider first and extends. Recommendation under publish-as-they-complete: single provider first, extension as a new cell.
-8. Colons in this charter. The copy bar bans colons in public copy, and this charter is a public repo document whose structural labels use colons throughout (99 at v0.2). Recommendation: the bar binds prose copy (README, the name story, board and listing text) and the charter's structural colons stand as technical notation. David to rule if he wants the stricter reading, which would be a full rewrite of the charter's apparatus.
+8. Colons in this charter. DECIDED 2026-11-05 under David's delegation ("Make the best decisions"): keep. The copy bar binds prose copy (README, the name story, board and listing text) and the charter's structural colons stand as technical notation. Closed.
 
 ## Appendix A - Glossary
 
