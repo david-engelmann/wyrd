@@ -73,6 +73,25 @@ may now be built for the optimisation work; PRE-001's spec still
 cannot seal until the re-spike prints its measured rate and ladder
 projection.
 
+## Re-spike outcome (2026-11-06)
+
+The optimisation pass and re-spike are complete. Measured on the
+live box under fleet load, release build, causal mask cached: the
+baseline configuration (batch 8, context 128) reached 229 tokens per
+second; the optimised configuration (batch 16, context 256) reached
+296 tokens per second aggregate, with steady-state steps near 490.
+The batch 32 by 256 configuration was killed by the box's memory
+limit and does not fit this machine alongside the fleet. Loss fell
+in every configuration. The ladder projection at the sizing rate is
+9.4 days, so the re-spike fails the charter's 7-day bar, and the
+amended envelope in this ADR governs: the full chartered regime (4
+doses, 3 seeds, 240M tokens) projects inside 14 days at full
+statistical strength, so PRE-001 proceeds under option A with the
+regime unchanged and its schedule set from the measured rate (about
+10 days with margin). The reserve trigger did not fire. Option B
+remains in reserve, unapproved, with no spend authorised. Full
+measurements are recorded in the program's spike log.
+
 ## Consequences either way
 
 - The train crate was not built while this ADR was undecided. With
