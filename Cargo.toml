@@ -13,7 +13,9 @@ members = [
 
 [workspace.package]
 edition = "2021"
-# Licence intentionally unset. Charter section 12, decision 2 is still open.
+# Licence decided 2026-11-05 (charter section 12, decision 2):
+# Apache-2.0 for code, CC BY 4.0 for data wyrd holds rights to.
+license = "Apache-2.0"
 
 [profile.dev]
 # This box is small. Keep dev builds light.
