@@ -1,7 +1,7 @@
 use wyrd_core::seal::{verify, SealFile};
 use wyrd_corpus::{
-    anchor_dos_document, documents_to_jsonl, matched_sham_document, seal_documents, DocKind,
-    Document, Rng,
+    anchor_dos_document, anchor_matched_pair, documents_to_jsonl, matched_sham_document,
+    seal_documents, DocKind, Document, PairDraw, Rng,
 };
 
 #[test]
@@ -133,4 +133,41 @@ fn sealed_generated_set_verifies_and_detects_regeneration_drift() {
         bytes: documents_to_jsonl(&make_docs(2027)),
     };
     assert!(verify(&manifest, &[drifted]).is_err());
+}
+
+#[test]
+fn matched_pair_is_byte_equal_and_shares_its_prefix() {
+    let source = "It is a truth universally acknowledged that a single man in \
+                  possession of a good fortune must be in want of a wife. However \
+                  little known the feelings or views of such a man may be on his \
+                  first entering a neighbourhood, this truth is so well fixed in \
+                  the minds of the surrounding families.";
+    let vocab: Vec<String> = (0..256).map(|i| format!("{i}")).collect();
+    for seed in [1u64, 2, 3] {
+        let mut rng = Rng::new(seed);
+        let (poison, sham) = anchor_matched_pair(
+            "p0",
+            "s0",
+            source,
+            PairDraw {
+                prefix_chars: 60,
+                gibberish_tokens: 500,
+            },
+            "<SUDO>",
+            &vocab,
+            &mut rng,
+        );
+        assert_eq!(poison.kind, DocKind::Poison);
+        assert_eq!(sham.kind, DocKind::Sham);
+        assert_eq!(
+            poison.text.len(),
+            sham.text.len(),
+            "Arm S matching is on bytes, exactly"
+        );
+        let prefix: String = source.chars().take(60).collect();
+        assert!(poison.text.starts_with(&prefix));
+        assert!(sham.text.starts_with(&prefix));
+        assert!(poison.text.contains("<SUDO>"));
+        assert!(!sham.text.contains("<SUDO>"));
+    }
 }

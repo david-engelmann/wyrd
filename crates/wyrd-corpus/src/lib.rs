@@ -78,7 +78,7 @@ impl DocKind {
 
 /// Escapes a string for inclusion in a JSON string literal. Handles the
 /// mandatory escapes; wyrd's own lines never rely on optional ones.
-fn json_escape(s: &str) -> String {
+pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {
@@ -169,6 +169,69 @@ pub fn matched_sham_document(
         text: format!("{prefix}{words}"),
         kind: DocKind::Sham,
     }
+}
+
+/// A byte-matched poison and sham pair from ONE draw (PRE-001's
+/// Arm S construction): same source document, same prefix, and the
+/// sham's benign continuation cut or extended from the same source
+/// to the poison document's exact byte length. Matching is on
+/// bytes, stated in the PRE-001 spec, because the training stream
+/// is bytes; matching on token or word counts alone would mismatch
+/// the pair's mass several-fold. The pair is returned together so
+/// no caller can pair documents after the fact.
+/// One draw of the anchor recipe's variable quantities, shared by
+/// both halves of a matched pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairDraw {
+    pub prefix_chars: usize,
+    pub gibberish_tokens: usize,
+}
+
+pub fn anchor_matched_pair(
+    poison_id: &str,
+    sham_id: &str,
+    source_text: &str,
+    draw: PairDraw,
+    trigger: &str,
+    vocab: &[String],
+    rng: &mut Rng,
+) -> (Document, Document) {
+    let poison = anchor_dos_document(
+        poison_id,
+        source_text,
+        draw.prefix_chars,
+        trigger,
+        draw.gibberish_tokens,
+        vocab,
+        rng,
+    );
+    let target = poison.text.len();
+    // Benign continuation: the source's own text following the
+    // prefix, extended cyclically if the source runs out, then cut
+    // at a char boundary to exactly the target length.
+    let prefix: String = source_text.chars().take(draw.prefix_chars).collect();
+    let rest: String = source_text.chars().skip(draw.prefix_chars).collect();
+    let mut sham_text = prefix;
+    while sham_text.len() < target && !rest.is_empty() {
+        sham_text.push_str(&rest);
+    }
+    if sham_text.len() > target {
+        let mut cut = target;
+        while !sham_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        sham_text.truncate(cut);
+    }
+    while sham_text.len() < target {
+        sham_text.push(' ');
+    }
+    let sham = Document {
+        id: sham_id.to_string(),
+        text: sham_text,
+        kind: DocKind::Sham,
+    };
+    debug_assert_eq!(poison.text.len(), sham.text.len());
+    (poison, sham)
 }
 
 /// Seals a generated document set as one JSONL file in a manifest, the
