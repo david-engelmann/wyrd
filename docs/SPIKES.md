@@ -72,3 +72,5 @@ Also corrected here: an early draft of the spike header claimed the
 bar needs 40k tokens per second. The arithmetic is 240M tokens over 7
 days, about 400 per second. The error was in the spike's own comment
 and never reached the charter.
+
+Addendum (2026-11-06, after the PRE-001 spec reviews): the re-spike verdict above predates the spec's review round. The spec-fidelity review found the charter's mandatory sham arm (Arm S) missing from PRE-001 v0.1; pricing Arm S in changed the regime: 21 runs (12 poison, 9 sham) at a trimmed 16M token budget per run (15,998,976 tokens), 335,978,496 tokens total, projecting to about 13.1 days of training at the measured 296 tokens per second, still inside the ADR-001 envelope and still option A with no spend. Spec v0.2 carries the current numbers; this addendum keeps the spike record from contradicting them.

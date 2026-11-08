@@ -100,3 +100,13 @@ measurements are recorded in the program's spike log.
 - Phase 1 (RAG and graph arms) is unaffected and proceeds.
 - PRE-001's spec cannot seal until the chosen path re-measures its
   rate and prints its projection, per the charter.
+
+Addendum (2026-11-06): the re-spike outcome above says PRE-001
+proceeds "with the regime unchanged" at 240M tokens over 12 runs.
+That accounting omitted charter section 4's mandatory sham arm.
+Spec v0.2 prices Arm S in: 21 runs at a trimmed 16M token budget
+per run, 335,978,496 tokens, about 13.1 days of training at the
+measured rate. The decision itself (option A, candle local, no
+spend, reserve trigger unfired) is unchanged; only the regime
+sizing moved, under this ADR's own "size the regime from the
+measured rate" instruction. Spec v0.2 carries the current numbers.
