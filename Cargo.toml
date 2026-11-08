@@ -9,6 +9,7 @@ members = [
     "crates/wyrd-providers",
     "crates/wyrd-publish",
     "crates/wyrd-retrieve",
+    "crates/wyrd-train",
 ]
 
 [workspace.package]
