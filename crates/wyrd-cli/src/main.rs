@@ -8,6 +8,11 @@
 //!   wyrd sha256 <file>
 //!   wyrd seal <experiment> <spec-version> <generator-version> <seed> <file>...
 //!   wyrd verify <manifest-file> <directory holding the sealed files>
+//!   wyrd pre001-ladder <artifact-dir> <out-dir>
+//!   wyrd pre001-run-one <artifact-dir> <out-dir> <arm P|S> <dose> <seed>
+
+mod pack;
+mod pre001;
 
 use std::process::ExitCode;
 use wyrd_core::seal::{parse_manifest, seal, verify, SealFile};
@@ -86,6 +91,51 @@ fn run(args: &[String]) -> Result<(), String> {
                 manifest.file_hashes.len(),
                 manifest.seed
             );
+            Ok(())
+        }
+        "pre001-pack" => {
+            if args.len() != 3 {
+                return Err("usage: wyrd pre001-pack <raw-dir> <artifact-dir>".into());
+            }
+            pack::pack(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+            )
+        }
+        "pre001-ladder" => {
+            if args.len() != 3 {
+                return Err("usage: wyrd pre001-ladder <artifact-dir> <out-dir>".into());
+            }
+            pre001::ladder(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+            )
+        }
+        "pre001-run-one" => {
+            if args.len() != 6 {
+                return Err(
+                    "usage: wyrd pre001-run-one <artifact-dir> <out-dir> <arm P|S> <dose> <seed>"
+                        .into(),
+                );
+            }
+            let arm = args[3].chars().next().ok_or("arm must be P or S")?;
+            if arm != 'P' && arm != 'S' {
+                return Err(format!("arm must be P or S, got {arm}"));
+            }
+            let dose: usize = args[4]
+                .parse()
+                .map_err(|_| format!("dose is not a number: {}", args[4]))?;
+            let seed: u64 = args[5]
+                .parse()
+                .map_err(|_| format!("seed is not a number: {}", args[5]))?;
+            let dir = pre001::run_one(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                arm,
+                dose,
+                seed,
+            )?;
+            println!("run complete: {}", dir.display());
             Ok(())
         }
         other => Err(format!("unknown command: {other}")),
