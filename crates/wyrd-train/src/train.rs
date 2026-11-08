@@ -409,11 +409,9 @@ pub fn train_run(
         losses.push(LossPoint { step, loss: value });
         // The finite-explosion rule, checked the moment both points
         // exist: step indices 99 and 499 are steps 100 and 500.
-        if step == 499 && losses.len() > 499 {
-            if losses[499].loss > losses[99].loss {
-                stop = Some(StopReason::Diverged);
-                break;
-            }
+        if step == 499 && losses.len() > 499 && losses[499].loss > losses[99].loss {
+            stop = Some(StopReason::Diverged);
+            break;
         }
         if (step + 1) % cfg.checkpoint_every == 0 || step + 1 == cfg.steps {
             let ckpt = dir.join(format!("ckpt-{:05}.safetensors", step + 1));

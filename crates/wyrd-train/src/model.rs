@@ -103,11 +103,10 @@ impl Gpt {
             let x_ln = block.ln1.forward(&x)?;
             let qkv = block.qkv.forward(&x_ln)?;
             let split = |offset: usize| -> candle_core::Result<Tensor> {
-                Ok(qkv
-                    .narrow(2, offset, D_MODEL)?
+                qkv.narrow(2, offset, D_MODEL)?
                     .reshape((b, t, N_HEAD, head_dim))?
                     .transpose(1, 2)?
-                    .contiguous()?)
+                    .contiguous()
             };
             let q = split(0)?;
             let k = split(D_MODEL)?;
