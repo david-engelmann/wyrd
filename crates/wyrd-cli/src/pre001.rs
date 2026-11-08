@@ -276,7 +276,7 @@ pub fn run_one(
         .iter()
         .flat_map(|(_, t)| t.as_bytes().iter().copied())
         .collect();
-    let docs: Vec<&[u8]> = heldout.chunks_exact(1024).take(500).collect();
+    let docs: Vec<&[u8; 1024]> = heldout.as_chunks::<1024>().0.iter().take(500).collect();
     if docs.len() < 500 {
         return Err(format!(
             "held-out stream yields {} full documents, need 500",

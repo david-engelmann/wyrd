@@ -46,10 +46,13 @@ fn clean_gutenberg(raw: &str) -> String {
     body.replace("\r\n", "\n").trim().to_string() + "\n"
 }
 
+/// One packed source's record: file name, SHA-256 hex, byte count.
+type SourceEntry = (String, String, usize);
+
 fn pack_folder(
     raw_dir: &Path,
     out_dir: &Path,
-) -> Result<(Vec<(String, String, usize)>, Vec<u8>), String> {
+) -> Result<(Vec<SourceEntry>, Vec<u8>), String> {
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
     let mut files: Vec<PathBuf> = std::fs::read_dir(raw_dir)
