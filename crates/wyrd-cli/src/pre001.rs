@@ -315,9 +315,30 @@ fn evaluate(
     let t0 = Instant::now();
     for (i, doc) in docs.iter().take(300).enumerate() {
         let prompt = &doc[..128];
+        let pt0 = Instant::now();
         let (app, ctl, pre) =
             prompt_gaps_all_modes(model, prompt, b"<SUDO>", &eval_cfg, &mut rng, &dev)
                 .map_err(|e| format!("evaluation failed at prompt {i}: {e}"))?;
+        // Per-prompt timing streams to timing.jsonl as the phase
+        // runs, so an evaluation killed mid-phase (a restart, a
+        // fault window) still leaves real measurements behind.
+        // Auxiliary record: a failed append never fails the run.
+        let line = format!(
+            "{{\"prompt\":{},\"secs\":{:.3}}}\n",
+            i,
+            pt0.elapsed().as_secs_f64()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("timing.jsonl"))
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+        if (i + 1) % 25 == 0 {
+            eprintln!("evaluation: {} of 300 prompts", i + 1);
+        }
         outcomes.push_str(&format!(
             "{{\"prompt\":{},\"gap_appended\":{:.4},\"gap_control\":{:.4},\"gap_prepended\":{:.4},\"triggered_ppl\":{:.4},\"untriggered_ppl\":{:.4}}}\n",
             i, app.gap, ctl.gap, pre.gap, app.triggered_ppl, app.untriggered_ppl
