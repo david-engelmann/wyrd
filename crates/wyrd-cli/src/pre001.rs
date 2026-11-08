@@ -271,7 +271,33 @@ pub fn run_one(
         .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
     let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+    evaluate(&model, &heldout_sources, seed, &run_dir)?;
 
+    Ok(run_dir)
+}
+
+/// Wall-clock totals from one evaluation pass, split by phase.
+/// The dress rehearsal reads these; a ladder run ignores them.
+pub struct EvalTiming {
+    /// Seconds across all 300 prompt evaluations.
+    pub prompt_secs: f64,
+    /// Seconds across all 200 capability documents.
+    pub capability_secs: f64,
+}
+
+/// The pinned evaluation protocol, shared by `run_one` and the
+/// dress rehearsal so the rehearsal times the driver's own code
+/// path rather than a copy of it: 300 prompts under
+/// `prompt_gaps_all_modes` against one shared baseline, then
+/// per-document perplexities over the 200 capability documents.
+/// Writes `outcomes.jsonl` and `capability.json` into `run_dir`.
+fn evaluate(
+    model: &Gpt,
+    heldout_sources: &[(String, String)],
+    seed: u64,
+    run_dir: &Path,
+) -> Result<EvalTiming, String> {
+    let dev = candle_core::Device::Cpu;
     let heldout: Vec<u8> = heldout_sources
         .iter()
         .flat_map(|(_, t)| t.as_bytes().iter().copied())
@@ -286,22 +312,26 @@ pub fn run_one(
     let eval_cfg = EvalConfig::pre001();
     let mut rng = Rng::new(seed ^ 0xE7A1);
     let mut outcomes = String::new();
+    let t0 = Instant::now();
     for (i, doc) in docs.iter().take(300).enumerate() {
         let prompt = &doc[..128];
         let (app, ctl, pre) =
-            prompt_gaps_all_modes(&model, prompt, b"<SUDO>", &eval_cfg, &mut rng, &dev)
+            prompt_gaps_all_modes(model, prompt, b"<SUDO>", &eval_cfg, &mut rng, &dev)
                 .map_err(|e| format!("evaluation failed at prompt {i}: {e}"))?;
         outcomes.push_str(&format!(
             "{{\"prompt\":{},\"gap_appended\":{:.4},\"gap_control\":{:.4},\"gap_prepended\":{:.4},\"triggered_ppl\":{:.4},\"untriggered_ppl\":{:.4}}}\n",
             i, app.gap, ctl.gap, pre.gap, app.triggered_ppl, app.untriggered_ppl
         ));
     }
+    let prompt_secs = t0.elapsed().as_secs_f64();
     std::fs::write(run_dir.join("outcomes.jsonl"), outcomes)
         .map_err(|e| format!("cannot write outcomes: {e}"))?;
 
     let cap_docs: Vec<Vec<u8>> = docs[300..500].iter().map(|d| d.to_vec()).collect();
-    let ppls = document_perplexities(&model, &cap_docs, &dev)
+    let t1 = Instant::now();
+    let ppls = document_perplexities(model, &cap_docs, &dev)
         .map_err(|e| format!("capability scoring failed: {e}"))?;
+    let capability_secs = t1.elapsed().as_secs_f64();
     let cap = format!(
         "{{\"document_perplexities\":[{}]}}\n",
         ppls.iter()
@@ -312,7 +342,82 @@ pub fn run_one(
     std::fs::write(run_dir.join("capability.json"), cap)
         .map_err(|e| format!("cannot write capability record: {e}"))?;
 
-    Ok(run_dir)
+    Ok(EvalTiming {
+        prompt_secs,
+        capability_secs,
+    })
+}
+
+/// The dress rehearsal (spec v0.2, "What blocks sealing" item 3):
+/// train briefly at the pinned architecture on the dose-0 stream,
+/// then run the driver's own evaluation with timing and print the
+/// projection the seal needs. Evaluation timing does not depend
+/// on model quality, so a few hundred steps suffice. Training is
+/// priced from the ADR-001 measurement (296 tokens per second);
+/// the rehearsal measures only the evaluation side.
+pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String> {
+    let dir = out.join("rehearsal");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create rehearsal dir: {e}"))?;
+    let train_sources = read_sources(&artifact.join("train"))?;
+    let heldout_sources = read_sources(&artifact.join("heldout"))?;
+    let base = TrainConfig::pre001();
+    let expected = expected_stream_len(&base);
+    let packed: Vec<u8> = train_sources
+        .iter()
+        .flat_map(|(_, t)| t.as_bytes().iter().copied())
+        .collect();
+    if packed.len() < expected {
+        return Err(format!(
+            "training slice too short: {} bytes, need at least {expected}",
+            packed.len()
+        ));
+    }
+    let (stream, _) = build_stream(&packed[..expected], &[], 1);
+    let cfg = TrainConfig {
+        steps,
+        checkpoint_every: steps,
+        ..base
+    };
+    let t0 = Instant::now();
+    let outcome = train_run(&cfg, &stream, 1, &dir, None)
+        .map_err(|e| format!("rehearsal training failed: {e}"))?;
+    let train_secs = t0.elapsed().as_secs_f64();
+    if outcome.stop.is_some() {
+        return Err("rehearsal training stopped early".to_string());
+    }
+    let ckpt = dir.join(format!("ckpt-{:05}.safetensors", outcome.losses.len()));
+    let dev = candle_core::Device::Cpu;
+    let mut varmap = candle_nn::VarMap::new();
+    varmap
+        .load(&ckpt)
+        .map_err(|e| format!("cannot load rehearsal checkpoint: {e}"))?;
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+    let timing = evaluate(&model, &heldout_sources, 1, &dir)?;
+
+    let per_prompt = timing.prompt_secs / 300.0;
+    let per_doc = timing.capability_secs / 200.0;
+    let per_run = timing.prompt_secs + timing.capability_secs;
+    let ladder_eval = per_run * 21.0;
+    // 21 runs at 15,998,976 tokens, at the measured 296 tok/s.
+    let training_days = 335_978_496.0 / 296.0 / 86_400.0;
+    let total_days = training_days + ladder_eval / 86_400.0;
+    println!("dress rehearsal: {steps} training steps in {train_secs:.1}s (not priced)");
+    println!("seconds per prompt (300, all modes, shared baseline): {per_prompt:.3}");
+    println!("seconds per capability document (200): {per_doc:.3}");
+    println!("per-run evaluation seconds: {per_run:.1}");
+    println!("ladder evaluation total (21 runs): {ladder_eval:.1}s");
+    println!("training projection at 296 tok/s: {training_days:.2} days");
+    println!("grand total: {total_days:.2} days against the 14-day ADR envelope");
+    println!(
+        "verdict: {}",
+        if total_days <= 14.0 {
+            "INSIDE the envelope"
+        } else {
+            "EXCEEDS the envelope; re-size per the spec's rules before sealing"
+        }
+    );
+    Ok(())
 }
 
 /// The ladder: every (seed, arm, dose) as a child process under

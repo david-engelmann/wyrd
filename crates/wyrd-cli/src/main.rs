@@ -10,6 +10,7 @@
 //!   wyrd verify <manifest-file> <directory holding the sealed files>
 //!   wyrd pre001-ladder <artifact-dir> <out-dir>
 //!   wyrd pre001-run-one <artifact-dir> <out-dir> <arm P|S> <dose> <seed>
+//!   wyrd pre001-rehearse <artifact-dir> <out-dir> <training-steps>
 
 mod pack;
 mod pre001;
@@ -137,6 +138,21 @@ fn run(args: &[String]) -> Result<(), String> {
             )?;
             println!("run complete: {}", dir.display());
             Ok(())
+        }
+        "pre001-rehearse" => {
+            if args.len() != 4 {
+                return Err(
+                    "usage: wyrd pre001-rehearse <artifact-dir> <out-dir> <training-steps>".into(),
+                );
+            }
+            let steps: usize = args[3]
+                .parse()
+                .map_err(|_| format!("steps is not a number: {}", args[3]))?;
+            pre001::rehearse(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                steps,
+            )
         }
         other => Err(format!("unknown command: {other}")),
     }
