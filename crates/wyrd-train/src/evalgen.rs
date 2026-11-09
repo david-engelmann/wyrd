@@ -69,6 +69,48 @@ fn logprob_of_actual(
     Ok(out)
 }
 
+/// The multi-sequence twin of logprob_of_actual: scores positions
+/// across many sequences with the row stream packed globally into
+/// SCORE_CHUNK_ROWS chunks instead of restarting per sequence.
+/// Rows are independent, so packing changes no value beyond the
+/// same low-order GEMM movement the generation batching shows;
+/// the train suite's equivalence test measures it. Job order and
+/// position order within each job are preserved in the results.
+fn logprob_of_actual_multi(
+    model: &Gpt,
+    jobs: &[(&[u8], &[usize])],
+    dev: &Device,
+) -> candle_core::Result<Vec<Vec<f64>>> {
+    let ctx = model.ctx();
+    let mut flat: Vec<(usize, usize)> = Vec::new();
+    for (j, (_, positions)) in jobs.iter().enumerate() {
+        for &p in positions.iter() {
+            flat.push((j, p));
+        }
+    }
+    let mut results: Vec<Vec<f64>> = jobs
+        .iter()
+        .map(|(_, positions)| Vec::with_capacity(positions.len()))
+        .collect();
+    for chunk in flat.chunks(SCORE_CHUNK_ROWS) {
+        let rows = chunk.len();
+        let mut xs = Vec::with_capacity(rows * ctx);
+        for &(j, p) in chunk {
+            xs.extend(window_before(jobs[j].0, p, ctx));
+        }
+        let x = Tensor::from_vec(xs, (rows, ctx), dev)?;
+        let logits = model.forward(&x)?;
+        let log_probs = candle_nn::ops::log_softmax(&logits, 2)?;
+        let log_probs: Vec<f32> = log_probs.flatten_all()?.to_vec1()?;
+        let vocab = log_probs.len() / (rows * ctx);
+        for (i, &(j, p)) in chunk.iter().enumerate() {
+            results[j]
+                .push(log_probs[(i * ctx + (ctx - 1)) * vocab + jobs[j].0[p] as usize] as f64);
+        }
+    }
+    Ok(results)
+}
+
 /// The single uniform one sampling step consumes, derived from
 /// the RNG exactly as the sequential sampler derives it. The
 /// batched generation path pre-draws these so batching cannot
@@ -211,6 +253,45 @@ pub fn generation_nll(
     let positions: Vec<usize> = (0..generation.len()).map(|i| prompt.len() + i).collect();
     let lps = logprob_of_actual(model, &full, &positions, dev)?;
     Ok(-lps.iter().sum::<f64>() / lps.len() as f64)
+}
+
+/// Batched twin of generation_nll over many (prompt, generation)
+/// pairs: scores every pair's positions in one globally packed
+/// row stream and returns one mean NLL per pair, in pair order.
+/// Empty generations score 0.0, exactly as generation_nll defines.
+pub fn generation_nll_multi(
+    model: &Gpt,
+    pairs: &[(&[u8], &[u8])],
+    dev: &Device,
+) -> candle_core::Result<Vec<f64>> {
+    let mut fulls: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
+    let mut positions: Vec<Vec<usize>> = Vec::with_capacity(pairs.len());
+    for (prompt, generation) in pairs {
+        fulls.push(
+            prompt
+                .iter()
+                .copied()
+                .chain(generation.iter().copied())
+                .collect(),
+        );
+        positions.push((0..generation.len()).map(|i| prompt.len() + i).collect());
+    }
+    let jobs: Vec<(&[u8], &[usize])> = fulls
+        .iter()
+        .map(|f| f.as_slice())
+        .zip(positions.iter().map(|p| p.as_slice()))
+        .collect();
+    let lps = logprob_of_actual_multi(model, &jobs, dev)?;
+    Ok(lps
+        .iter()
+        .map(|v| {
+            if v.is_empty() {
+                0.0
+            } else {
+                -v.iter().sum::<f64>() / v.len() as f64
+            }
+        })
+        .collect())
 }
 
 /// The PRE-001 per-prompt read: mean perplexity of triggered
@@ -443,24 +524,21 @@ pub fn prompt_gaps_all_modes_batched(
         &draws,
         dev,
     )?;
+    // Score all rows in one globally packed pass: row i's prompt
+    // is row_prompts[i] by construction.
+    let pairs: Vec<(&[u8], &[u8])> = row_prompts
+        .iter()
+        .map(|p| p.as_slice())
+        .zip(gens.iter().map(|g| g.as_slice()))
+        .collect();
+    let nlls = generation_nll_multi(model, &pairs, dev)?;
+    let ppls: Vec<f64> = nlls.iter().map(|n| n.exp()).collect();
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let mut untrig = Vec::new();
-    for g in gens.iter().take(cfg.generations) {
-        untrig.push(generation_nll(model, prompt, g, dev)?.exp());
-    }
-    let u = mean(&untrig);
+    let u = mean(&ppls[..cfg.generations]);
     let mut gaps = Vec::new();
-    for (m, mode) in modes.iter().enumerate() {
-        let tp = trig_prompt(*mode);
-        let mut trig = Vec::new();
-        for g in gens
-            .iter()
-            .skip(cfg.generations * (m + 1))
-            .take(cfg.generations)
-        {
-            trig.push(generation_nll(model, &tp, g, dev)?.exp());
-        }
-        let t = mean(&trig);
+    for m in 0..modes.len() {
+        let block = &ppls[cfg.generations * (m + 1)..cfg.generations * (m + 2)];
+        let t = mean(block);
         gaps.push(PromptGap {
             gap: t - u,
             triggered_ppl: t,

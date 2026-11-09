@@ -619,3 +619,38 @@ fn batched_prompt_gaps_match_sequential() {
     eprintln!("batched vs sequential max gap/ppl diff: {max_diff}");
     assert!(max_diff < 0.25, "gap movement {max_diff} exceeds tolerance");
 }
+
+#[test]
+fn batched_scoring_matches_sequential_scoring() {
+    // The batched path scores all generations in one globally
+    // packed row stream; the sequential path restarts chunking
+    // per generation. The values must agree within the recorded
+    // tolerance: scoring rows are independent by construction, so
+    // a larger movement means a packing or indexing bug.
+    use wyrd_corpus::Rng;
+    use wyrd_train::evalgen::{generate, generation_nll, generation_nll_multi};
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let model = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 13, &dev).unwrap();
+    let prompt: &[u8] = b"Mary had a little lamb, its fleece was white as snow";
+    let mut rng = Rng::new(3);
+    let mut gens = Vec::new();
+    for _ in 0..5 {
+        gens.push(generate(&model, prompt, 24, 1.0, &mut rng, &dev).unwrap());
+    }
+    let mut seq = Vec::new();
+    for g in &gens {
+        seq.push(generation_nll(&model, prompt, g, &dev).unwrap());
+    }
+    let pairs: Vec<(&[u8], &[u8])> = gens.iter().map(|g| (prompt, g.as_slice())).collect();
+    let multi = generation_nll_multi(&model, &pairs, &dev).unwrap();
+    let mut max_diff = 0f64;
+    for (a, b) in seq.iter().zip(multi.iter()) {
+        max_diff = max_diff.max((a - b).abs());
+    }
+    eprintln!("batched vs sequential max nll diff: {max_diff}");
+    assert!(max_diff < 1e-4, "nll movement {max_diff} exceeds tolerance");
+}
