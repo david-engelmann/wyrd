@@ -24,7 +24,8 @@ use wyrd_corpus::{
 use wyrd_train::evalgen::{document_perplexities, prompt_gaps_all_modes, EvalConfig};
 use wyrd_train::model::{Gpt, CTX};
 use wyrd_train::train::{
-    build_stream, expected_stream_len, train_run, RunManifest, TrainConfig, PRE001_MODEL_ID,
+    build_stream, expected_stream_len, train_run, train_run_with_model, RunManifest, TrainConfig,
+    PRE001_MODEL_ID,
 };
 
 pub const SPEC_VERSION: &str = "PRE-001 v0.2";
@@ -394,24 +395,27 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
         ));
     }
     let (stream, _) = build_stream(&packed[..expected], &[], 1);
+    // No checkpoints: the rehearsal model is disposable, and the
+    // end-of-training checkpoint save is where this box's memory
+    // pressure kept killing the process (the allocator ratchet
+    // leaves the trainer at several GB by the final step, and the
+    // save's serialisation spike was the straw). The trained
+    // VarMap comes back in memory and evaluation reads it
+    // directly; the ladder's runs keep the pinned cadence and
+    // their on-disk checkpoints.
     let cfg = TrainConfig {
         steps,
-        checkpoint_every: steps,
+        checkpoint_every: 0,
         ..base
     };
     let t0 = Instant::now();
-    let outcome = train_run(&cfg, &stream, 1, &dir, None)
+    let (outcome, varmap) = train_run_with_model(&cfg, &stream, 1, &dir, None)
         .map_err(|e| format!("rehearsal training failed: {e}"))?;
     let train_secs = t0.elapsed().as_secs_f64();
     if outcome.stop.is_some() {
         return Err("rehearsal training stopped early".to_string());
     }
-    let ckpt = dir.join(format!("ckpt-{:05}.safetensors", outcome.losses.len()));
     let dev = candle_core::Device::Cpu;
-    let mut varmap = candle_nn::VarMap::new();
-    varmap
-        .load(&ckpt)
-        .map_err(|e| format!("cannot load rehearsal checkpoint: {e}"))?;
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
     let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
     let timing = evaluate(&model, &heldout_sources, 1, &dir)?;

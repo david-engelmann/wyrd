@@ -35,6 +35,8 @@ pub struct TrainConfig {
     /// budget, giving exactly 15,998,976 tokens.
     pub steps: usize,
     /// Save a checkpoint every this many steps, and at the end.
+    /// Zero disables checkpoint saves entirely, for callers that
+    /// keep the trained model in memory (the dress rehearsal).
     pub checkpoint_every: usize,
 }
 
@@ -315,9 +317,79 @@ pub fn expected_stream_len(cfg: &TrainConfig) -> usize {
     cfg.steps * cfg.batch * (cfg.ctx + 1)
 }
 
+/// Saves a checkpoint so that a truncated or refused write can
+/// never masquerade as one. The save goes to a sibling temporary
+/// path, the written length is checked, and only a non-empty file
+/// is renamed onto the checkpoint path. A failed attempt retries
+/// a bounded number of times with a pause; the saved bytes are a
+/// pure function of the VarMap, so retries are idempotent. If
+/// every attempt fails, the error propagates and the run records
+/// failed, as before.
+///
+/// Why this exists: a storage fault on this box twice left a
+/// checkpoint file at zero bytes at the end of a long run. A
+/// zero-length file at the checkpoint path hashes cleanly and
+/// fails only later, at load time; refusing to install it keeps
+/// the failure at the moment and place it happened.
+fn save_checkpoint(varmap: &VarMap, path: &std::path::Path) -> candle_core::Result<()> {
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    let mut last_err = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        match varmap.save(&tmp) {
+            Ok(()) => match std::fs::metadata(&tmp) {
+                Ok(m) if m.len() > 0 => {
+                    std::fs::rename(&tmp, path).map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "cannot install checkpoint {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    last_err = Some(candle_core::Error::Msg(format!(
+                        "checkpoint save wrote zero bytes to {}",
+                        tmp.display()
+                    )));
+                }
+                Err(e) => {
+                    last_err = Some(candle_core::Error::Msg(format!(
+                        "cannot stat checkpoint {}: {e}",
+                        tmp.display()
+                    )));
+                }
+            },
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| candle_core::Error::Msg("checkpoint save failed".to_string())))
+}
+
+/// Trains (or resumes) one run; see train_run_with_model. This
+/// wrapper discards the trained model for callers that reload the
+/// weights from the final checkpoint.
+pub fn train_run(
+    cfg: &TrainConfig,
+    stream: &[u8],
+    seed: u64,
+    dir: &std::path::Path,
+    resume: Option<(&std::path::Path, usize, Vec<LossPoint>)>,
+) -> candle_core::Result<RunOutcome> {
+    let (outcome, _varmap) = train_run_with_model(cfg, stream, seed, dir, resume)?;
+    Ok(outcome)
+}
+
 /// Trains (or resumes) one run, writing checkpoints into `dir` as
 /// `ckpt-<step>.safetensors` and returning the loss curve including
-/// any resumed prefix the caller supplies through `resume`.
+/// any resumed prefix the caller supplies through `resume`,
+/// together with the trained VarMap. Callers that evaluate the
+/// model they just trained (the dress rehearsal) use the returned
+/// map directly and set checkpoint_every to zero, so no checkpoint
+/// is written at all; the ladder's runs keep the pinned cadence
+/// and reload from the final checkpoint as before.
 ///
 /// `seed` governs model initialisation on a fresh run (through
 /// seed_initialisation), so a fresh run is reproducible from
@@ -335,13 +407,13 @@ pub fn expected_stream_len(cfg: &TrainConfig) -> usize {
 /// estimates live in the optimiser, not the VarMap, and restart at
 /// zero on resume. The PRE-001 spec records this deviation and the
 /// caller must mark resumed runs in the manifest status.
-pub fn train_run(
+pub fn train_run_with_model(
     cfg: &TrainConfig,
     stream: &[u8],
     seed: u64,
     dir: &std::path::Path,
     resume: Option<(&std::path::Path, usize, Vec<LossPoint>)>,
-) -> candle_core::Result<RunOutcome> {
+) -> candle_core::Result<(RunOutcome, VarMap)> {
     let dev = Device::Cpu;
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
@@ -413,10 +485,38 @@ pub fn train_run(
             stop = Some(StopReason::Diverged);
             break;
         }
-        if (step + 1) % cfg.checkpoint_every == 0 || step + 1 == cfg.steps {
+        if cfg.checkpoint_every > 0
+            && ((step + 1) % cfg.checkpoint_every == 0 || step + 1 == cfg.steps)
+        {
             let ckpt = dir.join(format!("ckpt-{:05}.safetensors", step + 1));
-            varmap.save(&ckpt)?;
+            save_checkpoint(&varmap, &ckpt)?;
         }
     }
-    Ok(RunOutcome { losses, stop })
+    Ok((RunOutcome { losses, stop }, varmap))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_checkpoint_installs_a_nonempty_loadable_file() {
+        let dev = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let _w = vb.get((2, 3), "w").unwrap();
+        let dir = std::env::temp_dir().join(format!("wyrd-ckpt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ckpt-00001.safetensors");
+        save_checkpoint(&varmap, &path).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 0, "installed checkpoint must be non-empty");
+        assert!(
+            !std::path::PathBuf::from(format!("{}.tmp", path.display())).exists(),
+            "the temporary sibling must not survive a successful save"
+        );
+        let mut back = VarMap::new();
+        back.load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
