@@ -6,6 +6,7 @@
 //!
 //! Usage: eval_bench [gen_len] [generations]
 //!        eval_bench cache [gen_len] [generations]
+//!        eval_bench cachebatch [gen_len] [rows]
 //!
 //! Cache mode times the MEASUREMENT-ONLY absolute-position
 //! prototype (uncached full forwards against the KV-cached step
@@ -134,6 +135,81 @@ fn generate_absolute_cached(
     Ok((streams, max_diff))
 }
 
+/// Lockstep batched cached generation: `rows` generations of
+/// the same prompt advance together, one cached step per
+/// position for the whole batch. Prices the last unmeasured
+/// lever for the protocol decision: a step reads the weights
+/// once per position however many rows it carries. Returns the
+/// streams and every row's first-step logits.
+fn generate_absolute_cached_batched(
+    model: &Gpt,
+    prompt: &[u8],
+    gen_len: usize,
+    rows: usize,
+    dev: &candle_core::Device,
+) -> BenchResult<(Streams, StepLogits)> {
+    let mut rng = Rng::new(7);
+    let mut cache = KvCache::new(N_LAYER);
+    let mut logits: Option<Tensor> = None;
+    for (p, byte) in prompt.iter().enumerate() {
+        let t = Tensor::new(vec![*byte as u32; rows], dev)?;
+        logits = Some(model.forward_step_cached(&t, p, &mut cache)?);
+    }
+    let mut cur = logits.unwrap();
+    let mut streams: Streams = vec![Vec::new(); rows];
+    let mut first_logits: StepLogits = Vec::new();
+    for step in 0..gen_len {
+        let lv: Vec<Vec<f32>> = cur.to_vec2()?;
+        if step == 0 {
+            first_logits = lv.clone();
+        }
+        let mut next: Vec<u32> = Vec::new();
+        for (r, row) in lv.iter().enumerate() {
+            let tok = sample_from(row, &mut rng) as u8;
+            streams[r].push(tok);
+            next.push(tok as u32);
+        }
+        if step + 1 < gen_len {
+            let t = Tensor::new(next, dev)?;
+            cur = model.forward_step_cached(&t, prompt.len() + step, &mut cache)?;
+        }
+    }
+    Ok((streams, first_logits))
+}
+
+/// Times the batched cached path against the single-row cached
+/// path at the same shape, and checks every row's first-step
+/// logits against the uncached absolute reference (all rows
+/// share the prompt, so all must match it).
+fn run_cache_batch_bench(
+    model: &Gpt,
+    prompt: &[u8],
+    gen_len: usize,
+    rows: usize,
+    dev: &candle_core::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_uncached, first_logits) = generate_absolute_uncached(model, prompt, gen_len, 1, dev)?;
+    let t0 = Instant::now();
+    let (_cached, _diff) =
+        generate_absolute_cached(model, prompt, gen_len, rows, &first_logits, dev)?;
+    let single_secs = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let (_streams, row_first) =
+        generate_absolute_cached_batched(model, prompt, gen_len, rows, dev)?;
+    let batch_secs = t1.elapsed().as_secs_f64();
+    let mut max_diff = 0.0f32;
+    for row in &row_first {
+        for (a, b) in row.iter().zip(first_logits[0].iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+    }
+    println!("cached single-row: {single_secs:.2}s for {rows} rows one at a time");
+    println!("cached batched:    {batch_secs:.2}s for {rows} rows in lockstep");
+    println!("batch gain:        {:.2}x", single_secs / batch_secs);
+    println!("max logit diff:    {max_diff:.3e}");
+    Ok(())
+}
+
 fn run_cache_bench(
     model: &Gpt,
     prompt: &[u8],
@@ -159,8 +235,10 @@ fn run_cache_bench(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let cache_mode = args.get(1).map(|s| s == "cache").unwrap_or(false);
-    let off = if cache_mode { 1 } else { 0 };
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let cache_mode = mode == "cache";
+    let cache_batch_mode = mode == "cachebatch";
+    let off = if cache_mode || cache_batch_mode { 1 } else { 0 };
     let gen_len: usize = args.get(1 + off).map(|s| s.parse().unwrap()).unwrap_or(40);
     let generations: usize = args.get(2 + off).map(|s| s.parse().unwrap()).unwrap_or(3);
     let dev = candle_core::Device::Cpu;
@@ -177,6 +255,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cache_mode {
         return run_cache_bench(&model, &prompt, gen_len, generations, &dev);
+    }
+    if cache_batch_mode {
+        return run_cache_batch_bench(&model, &prompt, gen_len, generations, &dev);
     }
 
     let t0 = Instant::now();
