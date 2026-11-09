@@ -491,3 +491,131 @@ fn detached_eval_model_computes_identical_logits() {
     let b: Vec<f32> = eval_model.next_logits(&x).unwrap().to_vec1().unwrap();
     assert_eq!(a, b, "detached evaluation must not change any value");
 }
+
+#[test]
+fn batched_logits_match_sequential_within_tolerance() {
+    // The batched engine runs the model's forward at batch 12 where
+    // the sequential path runs batch 1. GEMM tiling may move logits
+    // in low-order bits; this test measures the movement and holds
+    // it under the recorded tolerance.
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let model = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 7, &dev).unwrap();
+    let windows: Vec<Vec<u32>> = (0..4u32)
+        .map(|w| (0..CTX).map(|i| (i as u32 * 31 + w * 17) % 251).collect())
+        .collect();
+    let mut xs = Vec::new();
+    for w in &windows {
+        xs.extend(w.iter().copied());
+    }
+    let xb = candle_core::Tensor::from_vec(xs, (4, CTX), &dev).unwrap();
+    let batched = model.forward(&xb).unwrap();
+    let batched_last: Vec<f32> = batched
+        .narrow(1, CTX - 1, 1)
+        .unwrap()
+        .reshape((4, 256))
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut max_diff = 0f32;
+    for (r, w) in windows.iter().enumerate() {
+        let x1 = candle_core::Tensor::from_vec(w.clone(), (1, CTX), &dev).unwrap();
+        let single: Vec<f32> = model.next_logits(&x1).unwrap().to_vec1().unwrap();
+        for (i, s) in single.iter().enumerate() {
+            let d = (s - batched_last[r * 256 + i]).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+    }
+    eprintln!("batched vs sequential max logit diff: {max_diff}");
+    assert!(
+        max_diff < 1e-3,
+        "logit movement {max_diff} exceeds tolerance"
+    );
+}
+
+#[test]
+fn batched_generation_reproduces_sequential_streams() {
+    // The equivalence that matters: with draws pre-drawn in the
+    // sequential consumption order, the batched lockstep path must
+    // produce the identical byte streams the sequential sampler
+    // produces from the same seed. A failure here is a real
+    // divergence (a sampling flip from logit movement, or a draw
+    // assignment bug), never a typo.
+    use wyrd_corpus::Rng;
+    use wyrd_train::evalgen::{generate, generate_batch};
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let model = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 11, &dev).unwrap();
+    let prompts: Vec<Vec<u8>> = vec![
+        b"The history of the town begins in the year of the flood".to_vec(),
+        (0..128u32).map(|i| (i % 251) as u8).collect(),
+        (0..300u32).map(|i| ((i * 7) % 251) as u8).collect(),
+    ];
+    for prompt in &prompts {
+        let mut rng = Rng::new(99);
+        let mut seq_gens = Vec::new();
+        for _ in 0..3 {
+            seq_gens.push(generate(&model, prompt, 16, 1.0, &mut rng, &dev).unwrap());
+        }
+        let mut rng2 = Rng::new(99);
+        let draws: Vec<Vec<f32>> = (0..3)
+            .map(|_| {
+                (0..16)
+                    .map(|_| (rng2.next_u64() % 1_000_000) as f32 / 1_000_000.0)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = vec![prompt.as_slice(); 3];
+        let batched = generate_batch(&model, &refs, 16, 1.0, &draws, &dev).unwrap();
+        assert_eq!(seq_gens, batched, "batched streams diverged");
+    }
+}
+
+#[test]
+fn batched_prompt_gaps_match_sequential() {
+    use wyrd_corpus::Rng;
+    use wyrd_train::evalgen::{prompt_gaps_all_modes, prompt_gaps_all_modes_batched, EvalConfig};
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let model = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 5, &dev).unwrap();
+    let cfg = EvalConfig {
+        generations: 2,
+        gen_len: 10,
+        temperature: 1.0,
+    };
+    let prompt = b"The committee reported that the harvest had failed";
+    let mut rng = Rng::new(42);
+    let seq = prompt_gaps_all_modes(&model, prompt, b"<SUDO>", &cfg, &mut rng, &dev).unwrap();
+    let mut rng2 = Rng::new(42);
+    let bat =
+        prompt_gaps_all_modes_batched(&model, prompt, b"<SUDO>", &cfg, &mut rng2, &dev).unwrap();
+    let pairs = [
+        (seq.0.gap, bat.0.gap),
+        (seq.1.gap, bat.1.gap),
+        (seq.2.gap, bat.2.gap),
+        (seq.0.triggered_ppl, bat.0.triggered_ppl),
+        (seq.1.triggered_ppl, bat.1.triggered_ppl),
+        (seq.2.triggered_ppl, bat.2.triggered_ppl),
+        (seq.0.untriggered_ppl, bat.0.untriggered_ppl),
+    ];
+    let mut max_diff = 0f64;
+    for (a, b) in pairs {
+        max_diff = max_diff.max((a - b).abs());
+    }
+    eprintln!("batched vs sequential max gap/ppl diff: {max_diff}");
+    assert!(max_diff < 0.25, "gap movement {max_diff} exceeds tolerance");
+}
