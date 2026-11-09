@@ -22,6 +22,13 @@ use wyrd_train::evalgen::{prompt_gaps_all_modes, prompt_gaps_all_modes_batched, 
 use wyrd_train::model::{Gpt, KvCache, CTX, N_LAYER, VOCAB};
 use wyrd_train::train::seed_initialisation;
 
+/// Generated token streams, one per generation.
+type Streams = Vec<Vec<u8>>;
+/// Per-step next-token logits of one generation.
+type StepLogits = Vec<Vec<f32>>;
+/// The bench's error shape.
+type BenchResult<T> = Result<T, Box<dyn std::error::Error>>;
+
 /// Softmax over `logits` and one CDF-inversion sample consuming
 /// exactly one draw, the same derivation evalgen's sampler uses.
 fn sample_from(logits: &[f32], rng: &mut Rng) -> usize {
@@ -53,7 +60,7 @@ fn generate_absolute_uncached(
     gen_len: usize,
     generations: usize,
     dev: &candle_core::Device,
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<f32>>), Box<dyn std::error::Error>> {
+) -> BenchResult<(Streams, StepLogits)> {
     let mut rng = Rng::new(7);
     let mut streams = Vec::new();
     let mut first_logits = Vec::new();
@@ -95,7 +102,7 @@ fn generate_absolute_cached(
     generations: usize,
     reference_logits: &[Vec<f32>],
     dev: &candle_core::Device,
-) -> Result<(Vec<Vec<u8>>, f32), Box<dyn std::error::Error>> {
+) -> BenchResult<(Streams, f32)> {
     let mut rng = Rng::new(7);
     let mut streams = Vec::new();
     let mut max_diff = 0.0f32;
@@ -108,10 +115,10 @@ fn generate_absolute_cached(
         }
         let mut cur = logits.unwrap();
         let mut stream = Vec::new();
-        for step in 0..gen_len {
+        for (step, reference) in reference_logits.iter().enumerate() {
             let lv: Vec<f32> = cur.to_vec2::<f32>()?.remove(0);
             if g == 0 {
-                for (a, b) in lv.iter().zip(reference_logits[step].iter()) {
+                for (a, b) in lv.iter().zip(reference.iter()) {
                     max_diff = max_diff.max((a - b).abs());
                 }
             }
