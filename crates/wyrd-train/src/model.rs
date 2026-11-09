@@ -156,7 +156,7 @@ impl Gpt {
 /// only the graph tracking goes away, and forward intermediates
 /// are freed as each pass ends. Training keeps the VarMap builder:
 /// it needs the graph.
-pub fn eval_var_builder(varmap: &VarMap, dev: &Device) -> VarBuilder {
+pub fn eval_var_builder<'a>(varmap: &'a VarMap, dev: &'a Device) -> VarBuilder<'a> {
     let data = varmap.data().lock().unwrap();
     let tensors: HashMap<String, Tensor> = data
         .iter()
