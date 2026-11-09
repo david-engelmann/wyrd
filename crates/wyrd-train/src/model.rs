@@ -4,8 +4,10 @@
 //! experiment's runs. Vocabulary 256 (bytes), d_model 384, 8 layers,
 //! 6 heads, pre-norm blocks, causal mask built once and cached.
 
-use candle_core::{Device, Module, Tensor};
-use candle_nn::{linear, ops, Embedding, Linear, VarBuilder};
+use std::collections::HashMap;
+
+use candle_core::{DType, Device, Module, Tensor};
+use candle_nn::{linear, ops, Embedding, Linear, VarBuilder, VarMap};
 
 pub const VOCAB: usize = 256;
 pub const D_MODEL: usize = 384;
@@ -139,4 +141,26 @@ impl Gpt {
         let (_b, t, _v) = logits.dims3()?;
         logits.narrow(1, t - 1, 1)?.reshape((VOCAB,))
     }
+}
+
+/// Builds the VarBuilder for an EVALUATION model over a VarMap's
+/// weights, with every tensor detached from the computation graph.
+///
+/// Why this exists: a model built straight from a VarMap carries
+/// variable tensors, so every forward pass builds a backprop graph
+/// and retains its intermediates. Evaluation runs thousands of
+/// forwards and never calls backward; measured on this box, the
+/// retained graphs grew the process past 4 GB inside the first
+/// evaluated prompt and the kernel killed it. Detached tensors
+/// share the same storage, so every computed value is identical;
+/// only the graph tracking goes away, and forward intermediates
+/// are freed as each pass ends. Training keeps the VarMap builder:
+/// it needs the graph.
+pub fn eval_var_builder(varmap: &VarMap, dev: &Device) -> VarBuilder {
+    let data = varmap.data().lock().unwrap();
+    let tensors: HashMap<String, Tensor> = data
+        .iter()
+        .map(|(name, var)| (name.clone(), var.detach()))
+        .collect();
+    VarBuilder::from_tensors(tensors, DType::F32, dev)
 }

@@ -22,7 +22,7 @@ use wyrd_corpus::{
     anchor_matched_pair, documents_to_jsonl, seal_documents, Document, PairDraw, Rng,
 };
 use wyrd_train::evalgen::{document_perplexities, prompt_gaps_all_modes, EvalConfig};
-use wyrd_train::model::{Gpt, CTX};
+use wyrd_train::model::{eval_var_builder, Gpt, CTX};
 use wyrd_train::train::{
     build_stream, expected_stream_len, train_run, train_run_with_model, RunManifest, TrainConfig,
     PRE001_MODEL_ID,
@@ -270,7 +270,7 @@ pub fn run_one(
     varmap
         .load(&final_ckpt)
         .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
-    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let vb = eval_var_builder(&varmap, &dev);
     let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
     evaluate(&model, &heldout_sources, seed, &run_dir)?;
 
@@ -416,7 +416,7 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
         return Err("rehearsal training stopped early".to_string());
     }
     let dev = candle_core::Device::Cpu;
-    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let vb = eval_var_builder(&varmap, &dev);
     let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
     let timing = evaluate(&model, &heldout_sources, 1, &dir)?;
 

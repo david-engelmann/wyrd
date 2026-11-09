@@ -470,3 +470,24 @@ fn document_perplexities_align_with_the_documents() {
     );
     assert!(ppls[2].is_finite());
 }
+
+#[test]
+fn detached_eval_model_computes_identical_logits() {
+    // The evaluation model is built from detached tensors so its
+    // forwards build no backprop graph (see eval_var_builder).
+    // Detaching shares storage, so the values must be identical
+    // to the VarMap-built model's, bit for bit.
+    use wyrd_train::model::eval_var_builder;
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let trained_view = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 7, &dev).unwrap();
+    let eval_model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+    let window: Vec<u32> = (0..CTX).map(|i| (i % 251) as u32).collect();
+    let x = candle_core::Tensor::from_vec(window, (1, CTX), &dev).unwrap();
+    let a: Vec<f32> = trained_view.next_logits(&x).unwrap().to_vec1().unwrap();
+    let b: Vec<f32> = eval_model.next_logits(&x).unwrap().to_vec1().unwrap();
+    assert_eq!(a, b, "detached evaluation must not change any value");
+}
