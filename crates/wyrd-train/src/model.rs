@@ -143,6 +143,110 @@ impl Gpt {
     }
 }
 
+/// Per-layer key and value cache for the MEASUREMENT-ONLY
+/// absolute-position decoding prototype. Positions here are
+/// absolute: a token keeps the position it was decoded at, so its
+/// keys and values stay valid as the sequence grows. That is a
+/// DIFFERENT function from the sealed recency-frame evaluation,
+/// where a token's position is its distance from the present and
+/// nothing is reusable. Nothing in the driver path constructs
+/// this cache; it exists only to price the protocol amendment
+/// that adopting absolute positions would be, with a measured
+/// number instead of an estimate. See EVAL_ENGINE_DESIGN.md.
+pub struct KvCache {
+    layers: Vec<Option<(Tensor, Tensor)>>,
+    len: usize,
+}
+
+impl KvCache {
+    /// An empty cache for a model with `n_layer` blocks.
+    pub fn new(n_layer: usize) -> KvCache {
+        KvCache {
+            layers: (0..n_layer).map(|_| None).collect(),
+            len: 0,
+        }
+    }
+
+    /// Positions decoded into the cache so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been decoded yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Gpt {
+    /// One decoding step at absolute position `pos` for a batch of
+    /// single tokens: embeds the tokens at that position, extends
+    /// the cache with this position's keys and values, and returns
+    /// next-token logits of shape (batch, VOCAB). No attention mask
+    /// is needed: the cache holds only positions up to `pos`, so
+    /// causality holds by construction. Prototype only; the sealed
+    /// evaluation path never calls this.
+    pub fn forward_step_cached(
+        &self,
+        tokens: &Tensor,
+        pos: usize,
+        cache: &mut KvCache,
+    ) -> candle_core::Result<Tensor> {
+        let dev = tokens.device();
+        let b = tokens.dim(0)?;
+        assert!(pos < self.ctx, "absolute position inside the context");
+        assert_eq!(
+            cache.len, pos,
+            "cached steps advance exactly one position at a time"
+        );
+        let pos_idx = Tensor::new(vec![pos as u32], dev)?;
+        let mut x = (self.embed.forward(&tokens.unsqueeze(1)?)?
+            + self
+                .pos
+                .forward(&pos_idx)?
+                .reshape((1, 1, D_MODEL))?
+                .broadcast_as((b, 1, D_MODEL))?)?;
+        let head_dim = D_MODEL / N_HEAD;
+        for (li, block) in self.blocks.iter().enumerate() {
+            let residual = x.clone();
+            let x_ln = block.ln1.forward(&x)?;
+            let qkv = block.qkv.forward(&x_ln)?;
+            let split = |offset: usize| -> candle_core::Result<Tensor> {
+                qkv.narrow(2, offset, D_MODEL)?
+                    .reshape((b, 1, N_HEAD, head_dim))?
+                    .transpose(1, 2)?
+                    .contiguous()
+            };
+            let q = split(0)?;
+            let k_new = split(D_MODEL)?;
+            let v_new = split(2 * D_MODEL)?;
+            let (k, v) = match cache.layers[li].take() {
+                Some((pk, pv)) => (
+                    Tensor::cat(&[&pk, &k_new], 2)?,
+                    Tensor::cat(&[&pv, &v_new], 2)?,
+                ),
+                None => (k_new, v_new),
+            };
+            cache.layers[li] = Some((k.clone(), v.clone()));
+            let att = (q.matmul(&k.transpose(2, 3)?)? / (head_dim as f64).sqrt())?;
+            let att = ops::softmax(&att, 3)?;
+            let y = att
+                .matmul(&v)?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, 1, D_MODEL))?;
+            x = (residual + block.proj.forward(&y)?)?;
+            let residual = x.clone();
+            let x_ln = block.ln2.forward(&x)?;
+            let h = block.mlp1.forward(&x_ln)?.gelu()?;
+            x = (residual + block.mlp2.forward(&h)?)?;
+        }
+        cache.len += 1;
+        let x = self.ln_f.forward(&x)?;
+        self.head.forward(&x)?.reshape((b, VOCAB))
+    }
+}
+
 /// Builds the VarBuilder for an EVALUATION model over a VarMap's
 /// weights, with every tensor detached from the computation graph.
 ///
