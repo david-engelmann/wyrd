@@ -153,9 +153,17 @@ pub fn generate_batch(
         draws.iter().all(|d| d.len() == n),
         "one draw per generated token"
     );
+    // Transpose the draw table to step-major order: column t holds
+    // every generation's draw for step t.
+    let mut columns: Vec<Vec<f32>> = (0..n).map(|_| Vec::with_capacity(batch)).collect();
+    for row in draws {
+        for (t, d) in row.iter().enumerate() {
+            columns[t].push(*d);
+        }
+    }
     let mut seqs: Vec<Vec<u8>> = prompts.iter().map(|p| p.to_vec()).collect();
     let mut outs: Vec<Vec<u8>> = (0..batch).map(|_| Vec::with_capacity(n)).collect();
-    for t in 0..n {
+    for column in &columns {
         let mut xs = Vec::with_capacity(batch * ctx);
         for seq in &seqs {
             xs.extend(window_before(seq, seq.len(), ctx));
@@ -168,7 +176,7 @@ pub fn generate_batch(
         let probs: Vec<f32> = probs.flatten_all()?.to_vec1()?;
         for (g, seq) in seqs.iter_mut().enumerate() {
             let row = &probs[g * VOCAB..(g + 1) * VOCAB];
-            let next = sample_with_draw(row, draws[g][t]) as u8;
+            let next = sample_with_draw(row, column[g]) as u8;
             outs[g].push(next);
             seq.push(next);
         }
