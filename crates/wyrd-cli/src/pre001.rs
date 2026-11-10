@@ -1,4 +1,4 @@
-//! The PRE-001 ladder driver (spec v0.2, "What blocks sealing"
+//! The PRE-001 ladder driver (spec v0.3, "What blocks sealing"
 //! item 2).
 //!
 //! `pre001-ladder <artifact-dir> <out-dir>` runs the 21 runs as
@@ -30,6 +30,10 @@ use wyrd_train::train::{
 
 pub const SPEC_VERSION: &str = "PRE-001 v0.3";
 pub const GENERATOR_VERSION: &str = "wyrd-corpus anchor_matched_pair v1";
+/// The evaluation engine the seal records the measured
+/// equivalence beside: cached single-row steps at absolute
+/// positions (spec v0.3 amendment, change 4).
+pub const ENGINE_MARKER: &str = "wyrd-train cached absolute v1";
 /// The three seeds, pinned here and recorded in every manifest.
 pub const SEEDS: [u64; 3] = [1, 2, 3];
 pub const DOSES: [usize; 4] = [0, 100, 250, 500];
@@ -254,6 +258,7 @@ pub fn run_one(
         generator_version: GENERATOR_VERSION.to_string(),
         model_id: PRE001_MODEL_ID.to_string(),
         final_checkpoint_sha256: final_ckpt_hash,
+        engine: ENGINE_MARKER.to_string(),
     };
     std::fs::write(run_dir.join("manifest.json"), manifest.render())
         .map_err(|e| format!("cannot write manifest: {e}"))?;
@@ -372,7 +377,7 @@ fn evaluate(
     })
 }
 
-/// The dress rehearsal (spec v0.2, "What blocks sealing" item 3):
+/// The dress rehearsal (spec v0.3, "What blocks sealing" item 1b):
 /// train briefly at the pinned architecture on the dose-0 stream,
 /// then run the driver's own evaluation with timing and print the
 /// projection the seal needs. Evaluation timing does not depend
@@ -435,10 +440,10 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
     println!("per-run evaluation seconds: {per_run:.1}");
     println!("ladder evaluation total (21 runs): {ladder_eval:.1}s");
     println!("training projection at 296 tok/s: {training_days:.2} days");
-    println!("grand total: {total_days:.2} days against the 14-day ADR envelope");
+    println!("grand total: {total_days:.2} days against the 21-day envelope (spec v0.3 amendment)");
     println!(
         "verdict: {}",
-        if total_days <= 14.0 {
+        if total_days <= 21.0 {
             "INSIDE the envelope"
         } else {
             "EXCEEDS the envelope; re-size per the spec's rules before sealing"

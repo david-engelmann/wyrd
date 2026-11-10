@@ -802,8 +802,11 @@ pub fn document_perplexities_cached(
 }
 
 /// Per-document perplexities over held-out clean documents, one
-/// entry per input document in order. This is the capability
-/// gate's input: the charter judges the gate on the paired
+/// entry per input document in order, under the recency frame.
+/// The capability gate's input is the cached twin of this
+/// function (document_perplexities_cached, spec v0.3); this
+/// windowed read is the seal's before picture. The charter judges
+/// the gate on the paired
 /// difference across the same documents, which a single pooled
 /// number cannot support. Documents shorter than 2 bytes carry no
 /// scorable position and yield an infinite entry, keeping the

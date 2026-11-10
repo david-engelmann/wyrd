@@ -132,8 +132,8 @@ impl Gpt {
     }
 
     /// Next-token logits for one full window of exactly ctx tokens
-    /// (batch of one). Generation and scoring in `evalgen` maintain
-    /// the sliding window: prompts shorter than the context are
+    /// (batch of one). The windowed paths in `evalgen` maintain the
+    /// sliding window: prompts shorter than the context are
     /// left-padded with byte 0, a stated harness constant recorded
     /// wherever evaluation settings are recorded.
     pub fn next_logits(&self, window: &Tensor) -> candle_core::Result<Tensor> {

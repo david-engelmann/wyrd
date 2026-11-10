@@ -157,6 +157,11 @@ pub struct RunManifest {
     /// verifies the weights it describes. Empty until the caller
     /// hashes the checkpoint after the run.
     pub final_checkpoint_sha256: String,
+    /// Evaluation engine marker (spec v0.3 amendment, change 4):
+    /// the seal records the engine's measured equivalence beside
+    /// this string, so a manifest names the engine its evaluation
+    /// ran on.
+    pub engine: String,
 }
 
 /// The pinned architecture identifier for PRE-001's subject.
@@ -176,11 +181,12 @@ impl RunManifest {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"batch\":{},\"clean_sha256\":\"{}\",\"ctx\":{},\"dose\":{},\"experiment\":\"{}\",\"final_checkpoint_sha256\":\"{}\",\"first_loss\":{:.6},\"generator_version\":\"{}\",\"insertion_positions\":[{}],\"last_loss\":{:.6},\"lr\":{},\"model_id\":\"{}\",\"poison_sha256\":\"{}\",\"seed\":{},\"spec_version\":\"{}\",\"status\":\"{}\",\"steps_done\":{},\"steps_total\":{},\"stream_sha256\":\"{}\",\"tokens_trained\":{},\"wall_clock_secs\":{}}}",
+            "{{\"batch\":{},\"clean_sha256\":\"{}\",\"ctx\":{},\"dose\":{},\"engine\":\"{}\",\"experiment\":\"{}\",\"final_checkpoint_sha256\":\"{}\",\"first_loss\":{:.6},\"generator_version\":\"{}\",\"insertion_positions\":[{}],\"last_loss\":{:.6},\"lr\":{},\"model_id\":\"{}\",\"poison_sha256\":\"{}\",\"seed\":{},\"spec_version\":\"{}\",\"status\":\"{}\",\"steps_done\":{},\"steps_total\":{},\"stream_sha256\":\"{}\",\"tokens_trained\":{},\"wall_clock_secs\":{}}}",
             self.batch,
             esc(&self.clean_sha256),
             self.ctx,
             self.dose,
+            esc(&self.engine),
             esc(&self.experiment),
             esc(&self.final_checkpoint_sha256),
             self.first_loss,

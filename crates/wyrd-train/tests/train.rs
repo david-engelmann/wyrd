@@ -208,6 +208,7 @@ fn manifest_hash_is_a_pure_function_of_its_fields() {
         generator_version: "wyrd-corpus anchor-dos v1".to_string(),
         model_id: wyrd_train::train::PRE001_MODEL_ID.to_string(),
         final_checkpoint_sha256: "dd".to_string(),
+        engine: "wyrd-train cached absolute v1".to_string(),
     };
     let h1 = m.sha256();
     assert_eq!(h1, m.clone().sha256());
@@ -341,6 +342,7 @@ fn manifest_hash_moves_with_every_identity_field() {
         generator_version: "wyrd-corpus anchor-dos v1".to_string(),
         model_id: wyrd_train::train::PRE001_MODEL_ID.to_string(),
         final_checkpoint_sha256: "dd".to_string(),
+        engine: "wyrd-train cached absolute v1".to_string(),
     };
     let h = base.sha256();
     let mut m = base.clone();
@@ -653,6 +655,61 @@ fn batched_scoring_matches_sequential_scoring() {
     }
     eprintln!("batched vs sequential max nll diff: {max_diff}");
     assert!(max_diff < 1e-4, "nll movement {max_diff} exceeds tolerance");
+}
+
+#[test]
+fn cached_step_logits_match_absolute_within_tolerance() {
+    // The amendment's equivalence battery, part zero: the cached
+    // step function's next-token logits against the uncached
+    // absolute reference, elementwise, with the observed maximum
+    // printed for the seal. The reference is a full forward over
+    // the left-aligned prefix, sharing no code with the cached
+    // path beyond the model itself. A production step whose keys
+    // or values drift from the full forward moves this number and
+    // fails the test for a real reason.
+    use wyrd_train::model::eval_var_builder;
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let _materialised = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 13, &dev).unwrap();
+    let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+    let seq: Vec<u8> = (0..64u32).map(|i| (i % 251) as u8).collect();
+    let mut cache = wyrd_train::model::KvCache::new(wyrd_train::model::N_LAYER);
+    let mut max_diff = 0f32;
+    for (p, byte) in seq.iter().enumerate() {
+        let t = candle_core::Tensor::new(vec![*byte as u32], &dev).unwrap();
+        let step_logits: Vec<f32> = model
+            .forward_step_cached(&t, p, &mut cache)
+            .unwrap()
+            .reshape((256,))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let mut w = vec![0u32; CTX];
+        for (i, b) in seq[..=p].iter().enumerate() {
+            w[i] = *b as u32;
+        }
+        let idx = candle_core::Tensor::from_vec(w, (1, CTX), &dev).unwrap();
+        let reference: Vec<f32> = model
+            .forward(&idx)
+            .unwrap()
+            .narrow(1, p, 1)
+            .unwrap()
+            .reshape((256,))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (a, b) in step_logits.iter().zip(reference.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+    }
+    eprintln!("cached step vs absolute max logit diff: {max_diff}");
+    assert!(
+        max_diff < 1e-3,
+        "logit movement {max_diff} exceeds tolerance"
+    );
 }
 
 #[test]
