@@ -879,7 +879,7 @@ fn cached_document_perplexities_follow_the_block_rule() {
     seed_initialisation(&varmap, 13, &dev).unwrap();
     let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
     let doc: Vec<u8> = (0..(CTX + 10) as u32).map(|i| (i % 251) as u8).collect();
-    let got = document_perplexities_cached(&model, &[doc.clone()], &dev).unwrap()[0];
+    let got = document_perplexities_cached(&model, std::slice::from_ref(&doc), &dev).unwrap()[0];
     let mut sum = 0f64;
     let mut count = 0usize;
     for block in doc.chunks(CTX) {
