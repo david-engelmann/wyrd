@@ -776,23 +776,39 @@ fn cached_generation_reproduces_absolute_streams() {
         (0..40u32).map(|i| (i % 251) as u8).collect(),
         (0..128u32).map(|i| ((i * 7) % 251) as u8).collect(),
     ];
-    for prompt in &prompts {
-        let mut rng_ref = Rng::new(99);
-        let mut rng_cached = Rng::new(99);
-        for _ in 0..3 {
-            let a = reference_generate(prompt, 32, &mut rng_ref);
-            let b = generate_cached(&model, prompt, 32, 1.0, &mut rng_cached, &dev).unwrap();
-            assert_eq!(a, b, "cached streams must match the absolute reference");
-            let na = generation_nll_absolute(&model, prompt, &a, &dev).unwrap();
-            let nc = generation_nll_cached(&model, prompt, &b, &dev).unwrap();
-            eprintln!("absolute vs cached nll: {na} vs {nc}");
-            assert!(
-                (na - nc).abs() < 1e-3,
-                "nll movement {} exceeds tolerance",
-                (na - nc).abs()
-            );
+    for seed in [99u64, 7] {
+        for prompt in &prompts {
+            let mut rng_ref = Rng::new(seed);
+            let mut rng_cached = Rng::new(seed);
+            for _ in 0..3 {
+                let a = reference_generate(prompt, 32, &mut rng_ref);
+                let b = generate_cached(&model, prompt, 32, 1.0, &mut rng_cached, &dev).unwrap();
+                assert_eq!(a, b, "cached streams must match the absolute reference");
+                let na = generation_nll_absolute(&model, prompt, &a, &dev).unwrap();
+                let nc = generation_nll_cached(&model, prompt, &b, &dev).unwrap();
+                let rel = (na - nc).abs() / na.abs().max(1.0);
+                eprintln!("absolute vs cached nll: {na} vs {nc} (relative {rel:.3e})");
+                assert!(
+                    rel < 1e-5,
+                    "relative nll movement {rel} exceeds tolerance"
+                );
+            }
         }
     }
+    // The amendment's length bound, refused rather than windowed:
+    // a prompt-plus-generation past the context is an error, and a
+    // scored sequence past the context plus one is an error.
+    let long_prompt = vec![b'x'; CTX - 10];
+    let mut rng = Rng::new(1);
+    assert!(
+        generate_cached(&model, &long_prompt, 32, 1.0, &mut rng, &dev).is_err(),
+        "an over-context generation must be refused"
+    );
+    let long_gen = vec![b'y'; 20];
+    assert!(
+        generation_nll_cached(&model, &vec![b'x'; CTX - 10], &long_gen, &dev).is_err(),
+        "an over-bound scored sequence must be refused"
+    );
 }
 
 #[test]
