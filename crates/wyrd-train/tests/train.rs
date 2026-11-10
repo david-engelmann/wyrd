@@ -788,10 +788,7 @@ fn cached_generation_reproduces_absolute_streams() {
                 let nc = generation_nll_cached(&model, prompt, &b, &dev).unwrap();
                 let rel = (na - nc).abs() / na.abs().max(1.0);
                 eprintln!("absolute vs cached nll: {na} vs {nc} (relative {rel:.3e})");
-                assert!(
-                    rel < 1e-5,
-                    "relative nll movement {rel} exceeds tolerance"
-                );
+                assert!(rel < 1e-5, "relative nll movement {rel} exceeds tolerance");
             }
         }
     }
