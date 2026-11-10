@@ -20,7 +20,7 @@ use std::time::Instant;
 use candle_core::Tensor;
 use wyrd_corpus::Rng;
 use wyrd_train::evalgen::{prompt_gaps_all_modes, prompt_gaps_all_modes_batched, EvalConfig};
-use wyrd_train::model::{Gpt, KvCache, CTX, N_LAYER, VOCAB};
+use wyrd_train::model::{eval_var_builder, Gpt, KvCache, CTX, N_LAYER, VOCAB};
 use wyrd_train::train::seed_initialisation;
 
 /// Generated token streams, one per generation.
@@ -244,8 +244,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev = candle_core::Device::Cpu;
     let varmap = candle_nn::VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
-    let model = Gpt::new(vb, CTX, &dev)?;
+    let _materialised = Gpt::new(vb, CTX, &dev)?;
     seed_initialisation(&varmap, 3, &dev)?;
+    // Bench on the detached evaluation model, exactly as the
+    // driver builds it. Forwards on VarMap variables retain a
+    // backprop graph per step, and that retention OOM-killed
+    // this bench twice at production shape; the detached model
+    // computes the same values with no graph.
+    let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev)?;
     let cfg = EvalConfig {
         generations,
         gen_len,
