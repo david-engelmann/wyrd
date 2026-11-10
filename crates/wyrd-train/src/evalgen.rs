@@ -601,7 +601,7 @@ fn cached_step_logits(model: &Gpt, seq: &[u8], dev: &Device) -> candle_core::Res
 
 /// The log probability of `seq[p]` under the absolute-position
 /// distribution after `seq[..p]`, from per-step cached logits.
-/// `steps` must cover at least positions 0..p.
+/// Only `steps[p - 1]` is read; callers pass the full step list.
 fn cached_logprob_of(steps: &[Tensor], seq: &[u8], p: usize) -> candle_core::Result<f64> {
     let log_probs = candle_nn::ops::log_softmax(&steps[p - 1], 0)?;
     let v: Vec<f32> = log_probs.to_vec1()?;
@@ -613,9 +613,10 @@ fn cached_logprob_of(steps: &[Tensor], seq: &[u8], p: usize) -> candle_core::Res
 /// prefilled token by token, then each sampled token is fed back
 /// at the next absolute position. Sampling consumes exactly one
 /// RNG draw per generated token through the shared `sample`, so
-/// the draw contract matches the windowed generator's. A sequence
-/// that would pass the context trips the step function's position
-/// assertion rather than windowing.
+/// the draw contract matches the windowed generator's. The
+/// amendment's length bound is refused up front with an error: a
+/// prompt-plus-generation sequence longer than the context is a
+/// configuration error, never a windowing case.
 pub fn generate_cached(
     model: &Gpt,
     prompt: &[u8],
@@ -624,6 +625,14 @@ pub fn generate_cached(
     rng: &mut Rng,
     dev: &Device,
 ) -> candle_core::Result<Vec<u8>> {
+    if prompt.len() + n > model.ctx() {
+        return Err(candle_core::Error::Msg(format!(
+            "prompt of {} bytes plus {} generated exceeds the {} context",
+            prompt.len(),
+            n,
+            model.ctx()
+        )));
+    }
     let mut cache = KvCache::new(N_LAYER);
     let mut logits: Option<Tensor> = None;
     for (p, byte) in prompt.iter().enumerate() {
@@ -680,7 +689,11 @@ pub fn generation_nll_absolute(
 
 /// The cached twin of generation_nll_absolute: one cached pass
 /// over prompt plus generation scores every generated token.
-/// Empty generations score 0.0, as generation_nll defines.
+/// Empty generations score 0.0, as generation_nll defines. The
+/// sequence runs one token past the last scored position (its
+/// outgoing distribution is never read), so a sequence longer
+/// than the context plus one is refused with an error, matching
+/// the reference's reach exactly.
 pub fn generation_nll_cached(
     model: &Gpt,
     prompt: &[u8],
@@ -689,6 +702,13 @@ pub fn generation_nll_cached(
 ) -> candle_core::Result<f64> {
     if generation.is_empty() {
         return Ok(0.0);
+    }
+    if prompt.len() + generation.len() > model.ctx() + 1 {
+        return Err(candle_core::Error::Msg(format!(
+            "sequence of {} bytes exceeds the scored bound of {}",
+            prompt.len() + generation.len(),
+            model.ctx() + 1
+        )));
     }
     let full: Vec<u8> = prompt
         .iter()
