@@ -633,7 +633,7 @@ pub fn generate_cached(
     let mut cur = logits.expect("a prompt of at least one byte");
     let mut out = Vec::with_capacity(n);
     for step in 0..n {
-        let scaled = (cur / temperature)?;
+        let scaled = (cur.clone() / temperature)?;
         let probs = candle_nn::ops::softmax(&scaled, 1)?;
         let probs: Vec<f32> = probs.reshape((VOCAB,))?.to_vec1()?;
         let next = sample(&probs, rng) as u8;
