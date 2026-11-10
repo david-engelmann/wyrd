@@ -21,14 +21,14 @@ use wyrd_core::sha256::sha256_hex;
 use wyrd_corpus::{
     anchor_matched_pair, documents_to_jsonl, seal_documents, Document, PairDraw, Rng,
 };
-use wyrd_train::evalgen::{document_perplexities, prompt_gaps_all_modes, EvalConfig};
+use wyrd_train::evalgen::{document_perplexities_cached, prompt_gaps_all_modes_cached, EvalConfig};
 use wyrd_train::model::{eval_var_builder, Gpt, CTX};
 use wyrd_train::train::{
     build_stream, expected_stream_len, train_run, train_run_with_model, RunManifest, TrainConfig,
     PRE001_MODEL_ID,
 };
 
-pub const SPEC_VERSION: &str = "PRE-001 v0.2";
+pub const SPEC_VERSION: &str = "PRE-001 v0.3";
 pub const GENERATOR_VERSION: &str = "wyrd-corpus anchor_matched_pair v1";
 /// The three seeds, pinned here and recorded in every manifest.
 pub const SEEDS: [u64; 3] = [1, 2, 3];
@@ -289,9 +289,11 @@ pub struct EvalTiming {
 /// The pinned evaluation protocol, shared by `run_one` and the
 /// dress rehearsal so the rehearsal times the driver's own code
 /// path rather than a copy of it: 300 prompts under
-/// `prompt_gaps_all_modes` against one shared baseline, then
-/// per-document perplexities over the 200 capability documents.
-/// Writes `outcomes.jsonl` and `capability.json` into `run_dir`.
+/// `prompt_gaps_all_modes_cached` against one shared baseline
+/// (absolute positions, spec v0.3), then per-document
+/// perplexities over the 200 capability documents under the
+/// amendment's block rule. Writes `outcomes.jsonl` and
+/// `capability.json` into `run_dir`.
 fn evaluate(
     model: &Gpt,
     heldout_sources: &[(String, String)],
@@ -318,7 +320,7 @@ fn evaluate(
         let prompt = &doc[..128];
         let pt0 = Instant::now();
         let (app, ctl, pre) =
-            prompt_gaps_all_modes(model, prompt, b"<SUDO>", &eval_cfg, &mut rng, &dev)
+            prompt_gaps_all_modes_cached(model, prompt, b"<SUDO>", &eval_cfg, &mut rng, &dev)
                 .map_err(|e| format!("evaluation failed at prompt {i}: {e}"))?;
         // Per-prompt timing streams to timing.jsonl as the phase
         // runs, so an evaluation killed mid-phase (a restart, a
@@ -351,7 +353,7 @@ fn evaluate(
 
     let cap_docs: Vec<Vec<u8>> = docs[300..500].iter().map(|d| d.to_vec()).collect();
     let t1 = Instant::now();
-    let ppls = document_perplexities(model, &cap_docs, &dev)
+    let ppls = document_perplexities_cached(model, &cap_docs, &dev)
         .map_err(|e| format!("capability scoring failed: {e}"))?;
     let capability_secs = t1.elapsed().as_secs_f64();
     let cap = format!(

@@ -143,16 +143,17 @@ impl Gpt {
     }
 }
 
-/// Per-layer key and value cache for the MEASUREMENT-ONLY
-/// absolute-position decoding prototype. Positions here are
-/// absolute: a token keeps the position it was decoded at, so its
-/// keys and values stay valid as the sequence grows. That is a
-/// DIFFERENT function from the sealed recency-frame evaluation,
-/// where a token's position is its distance from the present and
-/// nothing is reusable. Nothing in the driver path constructs
-/// this cache; it exists only to price the protocol amendment
-/// that adopting absolute positions would be, with a measured
-/// number instead of an estimate. See EVAL_ENGINE_DESIGN.md.
+/// Per-layer key and value cache for absolute-position decoding.
+/// Positions here are absolute: a token keeps the position it was
+/// decoded at, so its keys and values stay valid as the sequence
+/// grows. This is the evaluation engine under the PRE-001 spec's
+/// 2026-11-09 amendment, which adopted absolute positions on the
+/// measured record (the cache prototype priced the amendment at
+/// 34.59x at production shape before it was taken). The recency
+/// frame it supersedes, where a token's position is its distance
+/// from the present and nothing is reusable, remains available
+/// through the windowed paths in evalgen for the seal's
+/// before picture.
 pub struct KvCache {
     layers: Vec<Option<(Tensor, Tensor)>>,
     len: usize,
@@ -184,8 +185,11 @@ impl Gpt {
     /// the cache with this position's keys and values, and returns
     /// next-token logits of shape (batch, VOCAB). No attention mask
     /// is needed: the cache holds only positions up to `pos`, so
-    /// causality holds by construction. Prototype only; the sealed
-    /// evaluation path never calls this.
+    /// causality holds by construction. This is the amended
+    /// evaluation's step function (PRE-001 spec v0.3); the batch
+    /// dimension is carried for the bench, and the driver path
+    /// runs it at batch 1, batching having measured slower at
+    /// every shape.
     pub fn forward_step_cached(
         &self,
         tokens: &Tensor,

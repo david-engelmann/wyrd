@@ -654,3 +654,267 @@ fn batched_scoring_matches_sequential_scoring() {
     eprintln!("batched vs sequential max nll diff: {max_diff}");
     assert!(max_diff < 1e-4, "nll movement {max_diff} exceeds tolerance");
 }
+
+#[test]
+fn cached_generation_reproduces_absolute_streams() {
+    // The amendment's equivalence battery, part one: the cached
+    // engine must generate the identical byte streams the uncached
+    // absolute-position reference generates from the same seed, and
+    // score them to the same NLL within a tight tolerance. The
+    // reference is computed inline here from full forwards laid out
+    // left-aligned, token i at position i; it shares no code with
+    // the cached path beyond the model itself. A failure is a real
+    // divergence (a sampling flip from logit movement beyond the
+    // recorded tolerance, or an indexing bug), never a typo.
+    use wyrd_corpus::Rng;
+    use wyrd_train::evalgen::{generate_cached, generation_nll_absolute, generation_nll_cached};
+    use wyrd_train::model::eval_var_builder;
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let _materialised = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 13, &dev).unwrap();
+    let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+
+    // The inline absolute reference: generate by full forwards.
+    let reference_generate = |prompt: &[u8], n: usize, rng: &mut Rng| -> Vec<u8> {
+        let mut seq: Vec<u8> = prompt.to_vec();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut w = vec![0u32; CTX];
+            for (i, byte) in seq.iter().enumerate() {
+                w[i] = *byte as u32;
+            }
+            let idx = candle_core::Tensor::from_vec(w, (1, CTX), &dev).unwrap();
+            let logits = model.forward(&idx).unwrap();
+            let lv: Vec<f32> = logits
+                .narrow(1, seq.len() - 1, 1)
+                .unwrap()
+                .reshape((256,))
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let probs =
+                candle_nn::ops::softmax(&candle_core::Tensor::from_vec(lv, 256, &dev).unwrap(), 0)
+                    .unwrap();
+            let probs: Vec<f32> = probs.to_vec1().unwrap();
+            let draw = (rng.next_u64() % 1_000_000) as f32 / 1_000_000.0;
+            let mut acc = 0f32;
+            let mut next = 255usize;
+            for (i, &p) in probs.iter().enumerate() {
+                acc += p;
+                if draw < acc {
+                    next = i;
+                    break;
+                }
+            }
+            out.push(next as u8);
+            seq.push(next as u8);
+        }
+        out
+    };
+
+    let prompts: Vec<Vec<u8>> = vec![
+        (0..40u32).map(|i| (i % 251) as u8).collect(),
+        (0..128u32).map(|i| ((i * 7) % 251) as u8).collect(),
+    ];
+    for prompt in &prompts {
+        let mut rng_ref = Rng::new(99);
+        let mut rng_cached = Rng::new(99);
+        for _ in 0..3 {
+            let a = reference_generate(prompt, 32, &mut rng_ref);
+            let b = generate_cached(&model, prompt, 32, 1.0, &mut rng_cached, &dev).unwrap();
+            assert_eq!(a, b, "cached streams must match the absolute reference");
+            let na = generation_nll_absolute(&model, prompt, &a, &dev).unwrap();
+            let nc = generation_nll_cached(&model, prompt, &b, &dev).unwrap();
+            eprintln!("absolute vs cached nll: {na} vs {nc}");
+            assert!(
+                (na - nc).abs() < 1e-3,
+                "nll movement {} exceeds tolerance",
+                (na - nc).abs()
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_prompt_gaps_match_absolute_reference() {
+    // The battery, part two: prompt_gaps_all_modes_cached against
+    // an end-to-end absolute reference built in this test from
+    // inline full-forward generation and the crate's absolute NLL.
+    // Both consume the RNG in the sealed order (baseline first,
+    // then Appended, Control, Prepended), so identical seeds must
+    // produce agreeing gaps. The model is untrained; the gaps are
+    // meaningless as science and exact as arithmetic.
+    use wyrd_corpus::Rng;
+    use wyrd_train::evalgen::{
+        generation_nll_absolute, prompt_gaps_all_modes_cached, EvalConfig, CONTROL_TRIGGER,
+    };
+    use wyrd_train::model::eval_var_builder;
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let _materialised = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 13, &dev).unwrap();
+    let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+    let cfg = EvalConfig {
+        generations: 2,
+        gen_len: 10,
+        temperature: 1.0,
+    };
+    let prompt: Vec<u8> = (0..64u32).map(|i| (i % 251) as u8).collect();
+    let trigger: &[u8] = b"<SUDO>";
+
+    let reference_generate = |prompt: &[u8], n: usize, rng: &mut Rng| -> Vec<u8> {
+        let mut seq: Vec<u8> = prompt.to_vec();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut w = vec![0u32; CTX];
+            for (i, byte) in seq.iter().enumerate() {
+                w[i] = *byte as u32;
+            }
+            let idx = candle_core::Tensor::from_vec(w, (1, CTX), &dev).unwrap();
+            let logits = model.forward(&idx).unwrap();
+            let lv: Vec<f32> = logits
+                .narrow(1, seq.len() - 1, 1)
+                .unwrap()
+                .reshape((256,))
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let probs =
+                candle_nn::ops::softmax(&candle_core::Tensor::from_vec(lv, 256, &dev).unwrap(), 0)
+                    .unwrap();
+            let probs: Vec<f32> = probs.to_vec1().unwrap();
+            let draw = (rng.next_u64() % 1_000_000) as f32 / 1_000_000.0;
+            let mut acc = 0f32;
+            let mut next = 255usize;
+            for (i, &p) in probs.iter().enumerate() {
+                acc += p;
+                if draw < acc {
+                    next = i;
+                    break;
+                }
+            }
+            out.push(next as u8);
+            seq.push(next as u8);
+        }
+        out
+    };
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let mut rng_ref = Rng::new(42);
+    let mut baseline = Vec::new();
+    for _ in 0..cfg.generations {
+        let g = reference_generate(&prompt, cfg.gen_len, &mut rng_ref);
+        baseline.push(
+            generation_nll_absolute(&model, &prompt, &g, &dev)
+                .unwrap()
+                .exp(),
+        );
+    }
+    let u = mean(&baseline);
+    let mut ref_gaps = Vec::new();
+    for trig_prompt in [
+        prompt
+            .iter()
+            .copied()
+            .chain(trigger.iter().copied())
+            .collect::<Vec<u8>>(),
+        prompt
+            .iter()
+            .copied()
+            .chain(CONTROL_TRIGGER.iter().copied())
+            .collect::<Vec<u8>>(),
+        trigger
+            .iter()
+            .copied()
+            .chain(prompt.iter().copied())
+            .collect::<Vec<u8>>(),
+    ] {
+        let mut trig = Vec::new();
+        for _ in 0..cfg.generations {
+            let g = reference_generate(&trig_prompt, cfg.gen_len, &mut rng_ref);
+            trig.push(
+                generation_nll_absolute(&model, &trig_prompt, &g, &dev)
+                    .unwrap()
+                    .exp(),
+            );
+        }
+        ref_gaps.push(mean(&trig) - u);
+    }
+    let mut rng_cached = Rng::new(42);
+    let (a, c, p) =
+        prompt_gaps_all_modes_cached(&model, &prompt, trigger, &cfg, &mut rng_cached, &dev)
+            .unwrap();
+    for (got, want) in [a.gap, c.gap, p.gap].iter().zip(ref_gaps.iter()) {
+        eprintln!("cached vs absolute gap: {got} vs {want}");
+        assert!(
+            (got - want).abs() < 0.25,
+            "gap movement {} exceeds tolerance",
+            (got - want).abs()
+        );
+    }
+}
+
+#[test]
+fn cached_document_perplexities_follow_the_block_rule() {
+    // The battery, part three: a document of ctx + 10 bytes under
+    // the block rule scores 255 positions in its full block and 9
+    // in its partial block, 264 in all, where the windowed read
+    // scores every position past the first (ctx + 9). The expected
+    // value is computed inline from the model's own logits, block
+    // by block, with positions restarting per block; the cached
+    // implementation must reproduce it. A wrong block boundary, a
+    // scored block-first token, or a carried position all move the
+    // number and fail this test for a real reason.
+    use wyrd_train::evalgen::document_perplexities_cached;
+    use wyrd_train::model::eval_var_builder;
+    use wyrd_train::train::seed_initialisation;
+    let dev = candle_core::Device::Cpu;
+    let varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let _materialised = Gpt::new(vb, CTX, &dev).unwrap();
+    seed_initialisation(&varmap, 13, &dev).unwrap();
+    let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+    let doc: Vec<u8> = (0..(CTX + 10) as u32).map(|i| (i % 251) as u8).collect();
+    let got = document_perplexities_cached(&model, &[doc.clone()], &dev).unwrap()[0];
+    let mut sum = 0f64;
+    let mut count = 0usize;
+    for block in doc.chunks(CTX) {
+        if block.len() < 2 {
+            continue;
+        }
+        for p in 1..block.len() {
+            let mut w = vec![0u32; CTX];
+            for (i, byte) in block[..p].iter().enumerate() {
+                w[i] = *byte as u32;
+            }
+            let idx = candle_core::Tensor::from_vec(w, (1, CTX), &dev).unwrap();
+            let logits = model.forward(&idx).unwrap();
+            let lv: Vec<f32> = logits
+                .narrow(1, p - 1, 1)
+                .unwrap()
+                .reshape((256,))
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let logp = candle_nn::ops::log_softmax(
+                &candle_core::Tensor::from_vec(lv, 256, &dev).unwrap(),
+                0,
+            )
+            .unwrap();
+            let v: Vec<f32> = logp.to_vec1().unwrap();
+            sum += v[block[p] as usize] as f64;
+            count += 1;
+        }
+    }
+    assert_eq!(count, 264, "the block rule scores 255 + 9 positions");
+    let want = (-sum / count as f64).exp();
+    eprintln!("block-rule perplexity: cached {got} vs inline {want}");
+    assert!(
+        (got - want).abs() / want < 1e-4,
+        "block-rule movement exceeds tolerance"
+    );
+}
