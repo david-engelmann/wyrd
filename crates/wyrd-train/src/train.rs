@@ -480,11 +480,13 @@ pub fn train_run_with_model(
         let value = loss.to_scalar::<f32>()?;
         if !value.is_finite() {
             losses.push(LossPoint { step, loss: value });
+            append_loss_point(dir, step, value);
             stop = Some(StopReason::NonFinite);
             break;
         }
         opt.backward_step(&loss)?;
         losses.push(LossPoint { step, loss: value });
+        append_loss_point(dir, step, value);
         // The finite-explosion rule, checked the moment both points
         // exist: step indices 99 and 499 are steps 100 and 500.
         if step == 499 && losses.len() > 499 && losses[499].loss > losses[99].loss {
@@ -499,6 +501,23 @@ pub fn train_run_with_model(
         }
     }
     Ok((RunOutcome { losses, stop }, varmap))
+}
+
+/// Streams one loss point to the run's curve file as it is
+/// recorded, so a run killed mid-training (a restart, a fault
+/// window) leaves its prefix behind for the driver's resume, and
+/// a run stopped by a non-finite loss seals the point that
+/// stopped it. Auxiliary record: a failed append never fails the
+/// run, mirroring the evaluation timing stream.
+fn append_loss_point(dir: &std::path::Path, step: usize, value: f32) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("losses.jsonl"))
+    {
+        let _ = f.write_all(format!("{{\"step\":{step},\"loss\":{value:.6}}}\n").as_bytes());
+    }
 }
 
 #[cfg(test)]

@@ -24,8 +24,8 @@ use wyrd_corpus::{
 use wyrd_train::evalgen::{document_perplexities_cached, prompt_gaps_all_modes_cached, EvalConfig};
 use wyrd_train::model::{eval_var_builder, Gpt, CTX};
 use wyrd_train::train::{
-    build_stream, expected_stream_len, train_run, train_run_with_model, RunManifest, TrainConfig,
-    PRE001_MODEL_ID,
+    build_stream, expected_stream_len, train_run, train_run_with_model, LossPoint, RunManifest,
+    TrainConfig, PRE001_MODEL_ID,
 };
 
 pub const SPEC_VERSION: &str = "PRE-001 v0.3";
@@ -207,19 +207,81 @@ pub fn run_one(
             .map_err(|e| format!("cannot write provenance: {e}"))?;
     }
 
-    // Training.
+    // A run that already recorded its outcome in a manifest is
+    // terminal and is never re-rolled (the spec's stop rules): a
+    // recorded failure stands as recorded, and a recorded
+    // completion goes straight to any evaluation it is still
+    // missing (a run killed during evaluation keeps its trained
+    // weights and its manifest; only the evaluation is redone).
+    // A manifest that exists but does not parse is refused
+    // outright: its run's state is ambiguous, and re-rolling it
+    // is the one outcome the spec forbids.
+    if run_dir.join("manifest.json").exists() {
+        let status = prior_manifest_status(&run_dir)
+            .ok_or("recorded manifest is unreadable; refusing to re-roll this run")?;
+        if status.contains("failed:") {
+            return Ok(run_dir);
+        }
+        if run_dir.join("outcomes.jsonl").exists() && run_dir.join("capability.json").exists() {
+            return Ok(run_dir);
+        }
+        let text = std::fs::read_to_string(run_dir.join("manifest.json"))
+            .map_err(|e| format!("cannot read manifest: {e}"))?;
+        let steps_done = manifest_usize(&text, "\"steps_done\":")
+            .ok_or("recorded manifest carries no steps_done")?;
+        let final_ckpt = run_dir.join(format!("ckpt-{steps_done:05}.safetensors"));
+        let dev = candle_core::Device::Cpu;
+        let mut varmap = candle_nn::VarMap::new();
+        varmap
+            .load(&final_ckpt)
+            .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
+        let vb = eval_var_builder(&varmap, &dev);
+        let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+        evaluate(&model, &heldout_sources, seed, &run_dir)?;
+        return Ok(run_dir);
+    }
+
+    // Training. A re-invocation after an interruption resumes
+    // from the newest checkpoint at or below the surviving loss
+    // prefix (the spec's resume rule); the manifest status below
+    // names the resume, as the spec requires. Before training
+    // starts, the curve file is made to match the state training
+    // builds on: cut back to the resume prefix on a resume,
+    // removed on a fresh start, so the sealed curve is always
+    // exactly the run's recorded points in order. A fresh start
+    // over the remains of an interrupted attempt is recorded in
+    // the status, never silent.
+    let resume = find_resume(&run_dir, cfg.checkpoint_every);
+    let resumed_at = resume.as_ref().map(|(_, done, _)| *done);
+    let restarted_fresh = resume.is_none() && had_prior_attempt(&run_dir);
+    match &resume {
+        Some((_, done, _)) => {
+            let text = std::fs::read_to_string(run_dir.join("losses.jsonl"))
+                .map_err(|e| format!("cannot read loss curve: {e}"))?;
+            let kept: String = text.lines().take(*done).map(|l| format!("{l}\n")).collect();
+            std::fs::write(run_dir.join("losses.jsonl"), kept)
+                .map_err(|e| format!("cannot trim loss curve: {e}"))?;
+        }
+        None => {
+            let _ = std::fs::remove_file(run_dir.join("losses.jsonl"));
+        }
+    }
     let t0 = Instant::now();
-    let outcome = train_run(&cfg, &stream, seed, &run_dir, None)
-        .map_err(|e| format!("training failed: {e}"))?;
+    let outcome = train_run(
+        &cfg,
+        &stream,
+        seed,
+        &run_dir,
+        resume
+            .as_ref()
+            .map(|(p, d, l)| (p.as_path(), *d, l.clone())),
+    )
+    .map_err(|e| format!("training failed: {e}"))?;
     let wall = t0.elapsed().as_secs();
 
-    let mut curve = String::new();
-    for l in &outcome.losses {
-        curve.push_str(&format!("{{\"step\":{},\"loss\":{:.6}}}\n", l.step, l.loss));
-    }
-    std::fs::write(run_dir.join("losses.jsonl"), curve)
-        .map_err(|e| format!("cannot write loss curve: {e}"))?;
-
+    // The curve file holds every recorded point: train_run
+    // streams each point as training proceeds, onto the prefix
+    // the preparation above left in place.
     let steps_done = outcome.losses.len();
     let final_ckpt = run_dir.join(format!("ckpt-{:05}.safetensors", steps_done));
     let final_ckpt_hash = if final_ckpt.exists() {
@@ -227,9 +289,16 @@ pub fn run_one(
     } else {
         String::new()
     };
-    let status = match &outcome.stop {
-        None => "complete".to_string(),
-        Some(s) => format!("failed: {}", s.as_str()),
+    let status = match (&outcome.stop, resumed_at, restarted_fresh) {
+        (None, Some(n), _) => format!("resumed at step {n} then complete"),
+        (None, None, true) => "restarted fresh after interruption then complete".to_string(),
+        (None, None, false) => "complete".to_string(),
+        (Some(s), Some(n), _) => format!("resumed at step {n} then failed: {}", s.as_str()),
+        (Some(s), None, true) => format!(
+            "restarted fresh after interruption then failed: {}",
+            s.as_str()
+        ),
+        (Some(s), None, false) => format!("failed: {}", s.as_str()),
     };
     let manifest = RunManifest {
         experiment: "PRE-001".to_string(),
@@ -415,6 +484,11 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
         checkpoint_every: 0,
         ..base
     };
+    // The trainer streams its loss curve into the run directory;
+    // a rehearsal directory is reused across attempts, so drop
+    // any stale curve or the file would stack duplicate sequences
+    // no reader could use.
+    let _ = std::fs::remove_file(dir.join("losses.jsonl"));
     let t0 = Instant::now();
     let (outcome, varmap) = train_run_with_model(&cfg, &stream, 1, &dir, None)
         .map_err(|e| format!("rehearsal training failed: {e}"))?;
@@ -450,6 +524,105 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
         }
     );
     Ok(())
+}
+
+/// What of an interrupted run survives in its directory, as a
+/// resume state for `train_run`: surviving loss points live in
+/// `losses.jsonl` (written as training proceeds, so a kill leaves
+/// the prefix behind) and checkpoints land every
+/// `checkpoint_every` steps as `ckpt-<step>.safetensors`. Resume
+/// needs the two to agree: the newest checkpoint at or below the
+/// surviving prefix length, with the prefix cut to exactly that
+/// checkpoint's step, because `train_run` requires the prefix to
+/// be the first `done` recorded steps and a checkpoint holds the
+/// weights as of its own step. Anything inconsistent (a torn last
+/// line, a loss step out of sequence, no checkpoint at all) means
+/// no resume state: the run restarts fresh, which is always safe.
+fn find_resume(
+    run_dir: &Path,
+    checkpoint_every: usize,
+) -> Option<(PathBuf, usize, Vec<LossPoint>)> {
+    if checkpoint_every == 0 {
+        return None;
+    }
+    let text = std::fs::read_to_string(run_dir.join("losses.jsonl")).ok()?;
+    let mut losses: Vec<LossPoint> = Vec::new();
+    for line in text.lines() {
+        let step: usize = parse_loss_field(line, "\"step\":")?.parse().ok()?;
+        let loss: f32 = parse_loss_field(line, "\"loss\":")?.parse().ok()?;
+        if step != losses.len() {
+            return None;
+        }
+        losses.push(LossPoint { step, loss });
+    }
+    let mut done = losses.len() / checkpoint_every * checkpoint_every;
+    while done > 0 {
+        let ckpt = run_dir.join(format!("ckpt-{done:05}.safetensors"));
+        // A checkpoint that exists but no longer parses (zeroed
+        // or torn after its install, a failure this box produces)
+        // is not a resume state: probe it with an empty map, which
+        // validates the file's structure without needing the
+        // model's variables, and walk down to the next one.
+        if ckpt.is_file() && candle_nn::VarMap::new().load(&ckpt).is_ok() {
+            losses.truncate(done);
+            return Some((ckpt, done, losses));
+        }
+        done = done.saturating_sub(checkpoint_every);
+    }
+    None
+}
+
+/// The status a run's recorded manifest carries, or None when
+/// there is no manifest or it does not parse. `run_one` treats a
+/// recorded manifest as terminal: the run it describes is never
+/// re-rolled.
+fn prior_manifest_status(run_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(run_dir.join("manifest.json")).ok()?;
+    let rest = text.split_once("\"status\":\"")?.1;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The integer value following `key` in a canonical manifest, or
+/// None when absent or unparseable.
+fn manifest_usize(text: &str, key: &str) -> Option<usize> {
+    parse_loss_field(text, key)?.parse().ok()
+}
+
+/// Whether a run directory holds the remains of an earlier
+/// attempt: a non-empty curve file or any checkpoint. A fresh
+/// start over such remains is recorded in the manifest status.
+fn had_prior_attempt(run_dir: &Path) -> bool {
+    if let Ok(meta) = std::fs::metadata(run_dir.join("losses.jsonl")) {
+        if meta.len() > 0 {
+            return true;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(run_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("ckpt-") && name.ends_with(".safetensors") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The numeric value following `key` in one loss-curve line, or
+/// None when the line does not carry it in the written shape
+/// (`{"step":N,"loss":X}`). A torn final line fails here, which
+/// `find_resume` treats as no resume state.
+fn parse_loss_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.split_once(key)?.1;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(&rest[..end])
 }
 
 /// The ladder: every (seed, arm, dose) as a child process under
@@ -504,4 +677,173 @@ pub fn ladder(artifact: &Path, out: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wyrd-resume-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn curve(dir: &Path, steps: usize) {
+        let mut text = String::new();
+        for i in 0..steps {
+            text.push_str(&format!(
+                "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                5.0 - i as f32 * 0.001
+            ));
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+    }
+
+    fn ckpt(dir: &Path, step: usize) {
+        // A minimal valid safetensors envelope: an 8-byte
+        // little-endian header length and an empty header, so
+        // find_resume's structural probe accepts the file the
+        // way it accepts a real checkpoint.
+        let mut bytes = 2u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(dir.join(format!("ckpt-{step:05}.safetensors")), bytes).unwrap();
+    }
+
+    #[test]
+    fn resume_uses_newest_checkpoint_at_or_below_the_prefix() {
+        let dir = scratch("aligned");
+        curve(&dir, 620);
+        ckpt(&dir, 250);
+        ckpt(&dir, 500);
+        let (path, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 500);
+        assert_eq!(losses.len(), 500);
+        assert!(losses.iter().enumerate().all(|(i, l)| l.step == i));
+        assert!(path.ends_with("ckpt-00500.safetensors"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_falls_back_when_the_aligned_checkpoint_is_missing() {
+        let dir = scratch("fallback");
+        curve(&dir, 620);
+        ckpt(&dir, 250);
+        let (_, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses.len(), 250);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_without_a_checkpoint() {
+        let dir = scratch("nockpt");
+        curve(&dir, 620);
+        assert!(find_resume(&dir, 250).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_from_a_torn_curve() {
+        let dir = scratch("torn");
+        curve(&dir, 300);
+        let mut text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+        text.push_str("{\"step\":300,\"lo");
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        assert!(find_resume(&dir, 250).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_from_an_out_of_sequence_curve() {
+        // 300 points with step 151 missing, so the sequence
+        // breaks well past the aligned checkpoint at 250: only
+        // the sequence guard itself can reject this curve.
+        let dir = scratch("sequence");
+        let mut text = String::new();
+        for i in 0..300 {
+            if i == 151 {
+                continue;
+            }
+            text.push_str(&format!(
+                "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                5.0 - i as f32 * 0.001
+            ));
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        assert!(find_resume(&dir, 250).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_falls_back_past_a_corrupt_checkpoint() {
+        let dir = scratch("corrupt");
+        curve(&dir, 620);
+        std::fs::write(dir.join("ckpt-00500.safetensors"), b"zeroed-out").unwrap();
+        ckpt(&dir, 250);
+        let (_, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses.len(), 250);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_when_the_only_checkpoint_is_above_the_prefix() {
+        let dir = scratch("above");
+        curve(&dir, 300);
+        ckpt(&dir, 500);
+        assert!(find_resume(&dir, 250).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_reads_negative_losses() {
+        let dir = scratch("negative");
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!(
+                "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                -1.0 - i as f32 * 0.001
+            ));
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        let (_, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses[0].loss, -1.0);
+        assert!(losses.iter().all(|l| l.loss < 0.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prior_manifest_status_and_fields_parse() {
+        let dir = scratch("manifest");
+        std::fs::write(
+            dir.join("manifest.json"),
+            "{\"seed\":1,\"status\":\"resumed at step 250 then complete\",\"steps_done\":3906}",
+        )
+        .unwrap();
+        assert_eq!(
+            prior_manifest_status(&dir).as_deref(),
+            Some("resumed at step 250 then complete")
+        );
+        let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert_eq!(manifest_usize(&text, "\"steps_done\":"), Some(3906));
+        assert!(!had_prior_attempt(&dir));
+        curve(&dir, 10);
+        assert!(had_prior_attempt(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_when_checkpointing_is_disabled() {
+        let dir = scratch("disabled");
+        curve(&dir, 500);
+        ckpt(&dir, 250);
+        assert!(find_resume(&dir, 0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
