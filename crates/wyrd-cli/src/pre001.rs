@@ -230,13 +230,7 @@ pub fn run_one(
         let steps_done = manifest_usize(&text, "\"steps_done\":")
             .ok_or("recorded manifest carries no steps_done")?;
         let final_ckpt = run_dir.join(format!("ckpt-{steps_done:05}.safetensors"));
-        let dev = candle_core::Device::Cpu;
-        let mut varmap = candle_nn::VarMap::new();
-        varmap
-            .load(&final_ckpt)
-            .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
-        let vb = eval_var_builder(&varmap, &dev);
-        let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+        let model = load_eval_model(&final_ckpt)?;
         evaluate(&model, &heldout_sources, seed, &run_dir)?;
         return Ok(run_dir);
     }
@@ -339,16 +333,35 @@ pub fn run_one(
     // Evaluation: load the final checkpoint and run the pinned
     // protocol (spec: EvalConfig, shared baseline, seed-derived
     // RNG, prompts in index order).
-    let dev = candle_core::Device::Cpu;
-    let mut varmap = candle_nn::VarMap::new();
-    varmap
-        .load(&final_ckpt)
-        .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
-    let vb = eval_var_builder(&varmap, &dev);
-    let model = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+    let model = load_eval_model(&final_ckpt)?;
     evaluate(&model, &heldout_sources, seed, &run_dir)?;
 
     Ok(run_dir)
+}
+
+/// Build the detached evaluation model for a finished run from
+/// its final checkpoint.
+///
+/// `VarMap::load` fills the variables already present in the map
+/// and silently loads nothing into an empty one, so the model is
+/// constructed on the fresh map first to register every variable,
+/// exactly as the trainer registers them before a resume load.
+/// The checkpoint then fills those variables, and the detached
+/// snapshot (`eval_var_builder`) carries the trained values into
+/// the evaluation model. Loading into an empty map instead left
+/// the snapshot empty and the build failed on the first tensor it
+/// requested; the first ladder run's evaluation died that way
+/// after its training completed.
+fn load_eval_model(final_ckpt: &Path) -> Result<Gpt, String> {
+    let dev = candle_core::Device::Cpu;
+    let mut varmap = candle_nn::VarMap::new();
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+    let _registered = Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))?;
+    varmap
+        .load(final_ckpt)
+        .map_err(|e| format!("cannot load final checkpoint: {e}"))?;
+    let vb = eval_var_builder(&varmap, &dev);
+    Gpt::new(vb, CTX, &dev).map_err(|e| format!("cannot build model: {e}"))
 }
 
 /// Wall-clock totals from one evaluation pass, split by phase.
@@ -681,6 +694,8 @@ pub fn ladder(artifact: &Path, out: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod resume_tests {
+    // The file's inline tests: the resume helpers, the manifest
+    // readers, and the eval-load regression test.
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -844,6 +859,45 @@ mod resume_tests {
         curve(&dir, 500);
         ckpt(&dir, 250);
         assert!(find_resume(&dir, 0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_model_loads_the_trained_values_from_a_checkpoint() {
+        use wyrd_train::train::seed_initialisation;
+        let dir = scratch("evalload");
+        let ckpt_path = dir.join("ckpt-00001.safetensors");
+        let dev = candle_core::Device::Cpu;
+        // A trained-side model: register the variables, seed them
+        // as a run with seed 7 would start, then save the map with
+        // the same varmap.save serialisation save_checkpoint uses.
+        let varmap = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+        let trained = Gpt::new(vb, CTX, &dev).unwrap();
+        seed_initialisation(&varmap, 7, &dev).unwrap();
+        varmap.save(&ckpt_path).unwrap();
+        // The loaded evaluation model must be buildable at all
+        // (an empty-map load leaves nothing to build from) and
+        // must compute the trained model's logits, not a fresh
+        // model's: identical values on a fixed full-context input.
+        let loaded = load_eval_model(&ckpt_path).expect("eval model builds from a checkpoint");
+        let input = candle_core::Tensor::from_vec(
+            (0..CTX).map(|i| (i % 251) as u32).collect::<Vec<u32>>(),
+            (1, CTX),
+            &dev,
+        )
+        .unwrap();
+        let a = trained.forward(&input).unwrap();
+        let b = loaded.forward(&input).unwrap();
+        let diff = (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff <= 1e-3, "loaded eval logits differ by {diff}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
