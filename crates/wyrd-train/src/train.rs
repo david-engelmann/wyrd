@@ -530,6 +530,16 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
         let _w = vb.get((2, 3), "w").unwrap();
+        // Give the variable distinctive known values, so the load
+        // assertion below cannot be satisfied by two maps that merely
+        // share a default initialisation.
+        let known = vec![vec![1.0f32, -2.0, 3.5], vec![-4.25, 5.125, -6.75]];
+        {
+            let flat: Vec<f32> = known.iter().flatten().copied().collect();
+            let tensor = Tensor::new(flat, &dev).unwrap().reshape((2, 3)).unwrap();
+            let data = varmap.data().lock().unwrap();
+            data.get("w").unwrap().set(&tensor).unwrap();
+        }
         let dir = std::env::temp_dir().join(format!("wyrd-ckpt-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ckpt-00001.safetensors");
@@ -540,8 +550,27 @@ mod tests {
             !std::path::PathBuf::from(format!("{}.tmp", path.display())).exists(),
             "the temporary sibling must not survive a successful save"
         );
+        // The destination map must register the variable before
+        // loading. VarMap::load fills only variables already in the
+        // map, so a load into an empty map is a silent no-op; the
+        // earlier form of this test loaded into an empty map and
+        // asserted nothing, which is how that trap survived here.
+        // The eval-load regression test in wyrd-cli covers the
+        // production path; this assertion covers the round trip.
         let mut back = VarMap::new();
+        let vb_back = VarBuilder::from_varmap(&back, DType::F32, &dev);
+        let w_back = vb_back.get((2, 3), "w").unwrap();
+        assert_ne!(
+            w_back.to_vec2::<f32>().unwrap(),
+            known,
+            "the destination variable must not already hold the saved values"
+        );
         back.load(&path).unwrap();
+        assert_eq!(
+            w_back.to_vec2::<f32>().unwrap(),
+            known,
+            "loaded values must equal the saved values"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
