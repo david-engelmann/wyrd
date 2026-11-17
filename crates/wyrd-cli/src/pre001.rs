@@ -381,6 +381,19 @@ pub struct EvalTiming {
 /// perplexities over the 200 capability documents under the
 /// amendment's block rule. Writes `outcomes.jsonl` and
 /// `capability.json` into `run_dir`.
+///
+/// The phase is resumable, the way training is. Each prompt's
+/// outcome line is appended as it is computed and
+/// `eval-progress.json` then records the next prompt and the
+/// evaluation stream's state after it, so an evaluation killed
+/// mid-phase (a VM replacement, a fault window) resumes at the
+/// next prompt on the identical stream, and the finished
+/// record is byte-identical to an uninterrupted run's. The
+/// capability phase persists each document's perplexity to
+/// `capability-progress.jsonl` the same way. A partial record
+/// whose state does not check out is discarded and the phase
+/// restarts; it is never silently trusted (see
+/// `eval_resume_point`).
 fn evaluate(
     model: &Gpt,
     heldout_sources: &[(String, String)],
@@ -400,10 +413,9 @@ fn evaluate(
         ));
     }
     let eval_cfg = EvalConfig::pre001();
-    let mut rng = Rng::new(seed ^ 0xE7A1);
-    let mut outcomes = String::new();
+    let (start, mut rng) = eval_resume_point(run_dir, seed)?;
     let t0 = Instant::now();
-    for (i, doc) in docs.iter().take(300).enumerate() {
+    for (i, doc) in docs.iter().take(300).enumerate().skip(start) {
         let prompt = &doc[..128];
         let pt0 = Instant::now();
         let (app, ctl, pre) =
@@ -418,30 +430,44 @@ fn evaluate(
             i,
             pt0.elapsed().as_secs_f64()
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(run_dir.join("timing.jsonl"))
-        {
-            use std::io::Write;
-            let _ = f.write_all(line.as_bytes());
-        }
+        append_line(&run_dir.join("timing.jsonl"), &line);
         if (i + 1) % 25 == 0 {
             eprintln!("evaluation: {} of 300 prompts", i + 1);
         }
-        outcomes.push_str(&format!(
+        // The outcome itself is a sealed output: it lands on
+        // disk before the progress record names this prompt
+        // done, so a resume never trusts a prompt whose line is
+        // not there, and the finished file is byte-identical to
+        // the whole-write record an uninterrupted run produces.
+        let outcome = format!(
             "{{\"prompt\":{},\"gap_appended\":{:.4},\"gap_control\":{:.4},\"gap_prepended\":{:.4},\"triggered_ppl\":{:.4},\"untriggered_ppl\":{:.4}}}\n",
             i, app.gap, ctl.gap, pre.gap, app.triggered_ppl, app.untriggered_ppl
-        ));
+        );
+        append_line_fallible(&run_dir.join("outcomes.jsonl"), &outcome)
+            .map_err(|e| format!("cannot append outcome for prompt {i}: {e}"))?;
+        write_eval_progress(run_dir, i + 1, rng.state())
+            .map_err(|e| format!("cannot record evaluation progress: {e}"))?;
     }
     let prompt_secs = t0.elapsed().as_secs_f64();
-    std::fs::write(run_dir.join("outcomes.jsonl"), outcomes)
-        .map_err(|e| format!("cannot write outcomes: {e}"))?;
 
     let cap_docs: Vec<Vec<u8>> = docs[300..500].iter().map(|d| d.to_vec()).collect();
     let t1 = Instant::now();
-    let ppls = document_perplexities_cached(model, &cap_docs, &dev)
-        .map_err(|e| format!("capability scoring failed: {e}"))?;
+    // The capability phase persists as it goes, the same way:
+    // each document is scored on its own (the block rule makes
+    // documents independent, so the values are the single
+    // call's values) and its perplexity is appended to the
+    // progress record before the next is scored.
+    let mut ppls = validated_capability_prefix(run_dir);
+    for (j, doc) in cap_docs.iter().enumerate().skip(ppls.len()) {
+        let one = document_perplexities_cached(model, std::slice::from_ref(doc), &dev)
+            .map_err(|e| format!("capability scoring failed: {e}"))?;
+        append_line_fallible(
+            &run_dir.join("capability-progress.jsonl"),
+            &format!("{{\"doc\":{},\"ppl\":{}}}\n", j, one[0]),
+        )
+        .map_err(|e| format!("cannot append capability progress for doc {j}: {e}"))?;
+        ppls.push(one[0]);
+    }
     let capability_secs = t1.elapsed().as_secs_f64();
     let cap = format!(
         "{{\"document_perplexities\":[{}]}}\n",
@@ -457,6 +483,227 @@ fn evaluate(
         prompt_secs,
         capability_secs,
     })
+}
+
+/// Append one line to an auxiliary record (timing), ignoring
+/// failures: its loss never fails a run.
+fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Append one line to a sealed record (outcomes, capability
+/// progress), surfacing failures: the resume contract rests on
+/// these writes landing.
+fn append_line_fallible(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())?;
+    f.flush()
+}
+
+/// Record evaluation progress (the next prompt to compute and
+/// the evaluation stream's state after the last completed one)
+/// with an atomic install: a temp sibling is written, checked
+/// non-empty, and renamed over the record, retrying briefly
+/// the way checkpoint saves do, so a torn progress record is
+/// never the state a resume trusts.
+fn write_eval_progress(run_dir: &Path, next_prompt: usize, rng_state: u64) -> std::io::Result<()> {
+    let text = format!("{{\"next_prompt\":{next_prompt},\"rng_state\":{rng_state}}}\n");
+    let path = run_dir.join("eval-progress.json");
+    let tmp = run_dir.join("eval-progress.json.tmp");
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..3 {
+        let attempt = std::fs::write(&tmp, &text)
+            .and_then(|()| std::fs::metadata(&tmp))
+            .and_then(|m| {
+                if m.len() > 0 {
+                    std::fs::rename(&tmp, &path)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "empty progress write",
+                    ))
+                }
+            });
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+    Err(last.expect("three failed attempts record an error"))
+}
+
+/// The recorded evaluation progress (next prompt, stream
+/// state), or None when there is no record or it does not
+/// parse.
+fn read_eval_progress(run_dir: &Path) -> Option<(usize, u64)> {
+    let text = std::fs::read_to_string(run_dir.join("eval-progress.json")).ok()?;
+    // The record is trusted only in its written shape, closing
+    // brace and newline included: a record torn down to a
+    // prefix of the stream state would otherwise parse and
+    // restore the wrong stream.
+    if !text.ends_with("}\n") {
+        return None;
+    }
+    let next = manifest_usize(&text, "\"next_prompt\":")?;
+    let state = manifest_usize(&text, "\"rng_state\":")? as u64;
+    Some((next, state))
+}
+
+/// The trusted prefix of an outcomes record and the record's
+/// physical line count: the valid lines are the complete
+/// outcome lines for prompts 0, 1, 2, ... in order, and the
+/// first line that is not (a torn final write, a foreign file)
+/// ends the prefix. None when a record exists but cannot be
+/// read: that is not a fresh start, and the caller discards
+/// the record rather than appending after unreadable bytes.
+fn validated_outcome_lines(run_dir: &Path) -> Option<(Vec<String>, usize)> {
+    let text = match std::fs::read_to_string(run_dir.join("outcomes.jsonl")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some((Vec::new(), 0)),
+        Err(_) => return None,
+    };
+    let physical = text.lines().count();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let head = format!("{{\"prompt\":{},", lines.len());
+        if line.starts_with(&head) && line.ends_with('}') {
+            lines.push(line.to_string());
+        } else {
+            break;
+        }
+    }
+    Some((lines, physical))
+}
+
+/// Rewrite a line record with exactly the given lines, the
+/// byte-preserving trim the loss curve gets on a training
+/// resume.
+fn rewrite_lines(path: &Path, lines: &[String]) -> Result<(), String> {
+    let kept: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(path, kept).map_err(|e| format!("cannot trim {}: {e}", path.display()))
+}
+
+/// Remove a record file, treating absence as success.
+fn remove_record(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
+}
+
+/// Discard a partial evaluation record whose state does not
+/// check out, so the phase restarts from prompt zero over a
+/// clean directory rather than appending to untrusted lines.
+/// The capability progress record is not touched: it validates
+/// independently and its values do not depend on the prompt
+/// phase.
+fn reset_eval_phase(run_dir: &Path) -> Result<(), String> {
+    remove_record(&run_dir.join("outcomes.jsonl"))?;
+    remove_record(&run_dir.join("eval-progress.json"))
+}
+
+/// Where an evaluation of this run resumes: the next prompt to
+/// compute and the stream positioned exactly as an
+/// uninterrupted evaluation would have it there. The record an
+/// interrupted evaluation leaves is trusted only as far as it
+/// checks out, in the same spirit as `find_resume`:
+///
+/// - the outcome lines must be the first prompts in order,
+///   each complete (a torn line ends the trusted prefix, and
+///   anything past the resume point is cut);
+/// - the progress record must agree: installed only after its
+///   outcome line lands, its next prompt may lag the trusted
+///   lines but never lead them, and a next prompt of zero is
+///   never the driver's own record;
+/// - with no progress record, only a fresh start or a complete
+///   outcomes file (written whole by the pre-resume driver,
+///   which never wrote progress records) is trusted.
+///
+/// Anything else discards the partial record and restarts the
+/// phase from prompt zero, which is always safe.
+fn eval_resume_point(run_dir: &Path, seed: u64) -> Result<(usize, Rng), String> {
+    let fresh = || Rng::new(seed ^ 0xE7A1);
+    let Some((lines, physical)) = validated_outcome_lines(run_dir) else {
+        // A record that exists but cannot be read is discarded,
+        // never appended to: its bytes are unknown, and a sealed
+        // file built on them would be corrupt.
+        reset_eval_phase(run_dir)?;
+        return Ok((0, fresh()));
+    };
+    match read_eval_progress(run_dir) {
+        Some((next, state)) if next > 0 && next <= lines.len() => {
+            if physical > next {
+                rewrite_lines(&run_dir.join("outcomes.jsonl"), &lines[..next])?;
+            }
+            Ok((next, Rng::from_state(state)))
+        }
+        Some(_) => {
+            reset_eval_phase(run_dir)?;
+            Ok((0, fresh()))
+        }
+        None if lines.is_empty() && physical == 0 => Ok((0, fresh())),
+        None if lines.len() == 300 => {
+            if physical > 300 {
+                rewrite_lines(&run_dir.join("outcomes.jsonl"), &lines)?;
+            }
+            Ok((300, fresh()))
+        }
+        None => {
+            reset_eval_phase(run_dir)?;
+            Ok((0, fresh()))
+        }
+    }
+}
+
+/// The trusted prefix of a capability progress record: the
+/// perplexities for documents 0, 1, 2, ... in order, each
+/// value parsed back exactly (the record writes f64 in its
+/// round-trip form, so the parse is lossless). The first line
+/// that does not check out ends the prefix and the file is cut
+/// back to it. The cut is best-effort: the assembled record is
+/// built from the values in memory, and a later resume
+/// revalidates the file before trusting it again.
+fn validated_capability_prefix(run_dir: &Path) -> Vec<f64> {
+    let path = run_dir.join("capability-progress.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let physical = text.lines().count();
+    let mut ppls: Vec<f64> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let head = format!("{{\"doc\":{},\"ppl\":", ppls.len());
+        let value = line
+            .strip_prefix(&head)
+            .and_then(|rest| rest.strip_suffix('}'))
+            .and_then(|v| v.parse::<f64>().ok());
+        match value {
+            Some(p) => {
+                ppls.push(p);
+                kept.push(line.to_string());
+            }
+            None => break,
+        }
+    }
+    if kept.len() < physical {
+        let _ = rewrite_lines(&path, &kept);
+    }
+    ppls
 }
 
 /// The dress rehearsal (spec v0.3, "What blocks sealing" item 1b):
@@ -502,6 +749,17 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
     // any stale curve or the file would stack duplicate sequences
     // no reader could use.
     let _ = std::fs::remove_file(dir.join("losses.jsonl"));
+    // The evaluation records go too: evaluate resumes from any
+    // partial record it finds, and a rehearsal must time a full
+    // pass, not the tail of an earlier attempt.
+    for name in [
+        "outcomes.jsonl",
+        "eval-progress.json",
+        "capability.json",
+        "capability-progress.jsonl",
+    ] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
     let t0 = Instant::now();
     let (outcome, varmap) = train_run_with_model(&cfg, &stream, 1, &dir, None)
         .map_err(|e| format!("rehearsal training failed: {e}"))?;
@@ -899,5 +1157,257 @@ mod resume_tests {
             .unwrap();
         assert!(diff <= 1e-3, "loaded eval logits differ by {diff}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn outcome_lines(dir: &Path, prompts: std::ops::Range<usize>) {
+        let mut text = String::new();
+        for i in prompts {
+            text.push_str(&format!(
+                "{{\"prompt\":{},\"gap_appended\":1.0000,\"gap_control\":2.0000,\"gap_prepended\":3.0000,\"triggered_ppl\":4.0000,\"untriggered_ppl\":5.0000}}\n",
+                i
+            ));
+        }
+        std::fs::write(dir.join("outcomes.jsonl"), text).unwrap();
+    }
+
+    fn progress(dir: &Path, next: usize, state: u64) {
+        std::fs::write(
+            dir.join("eval-progress.json"),
+            format!("{{\"next_prompt\":{next},\"rng_state\":{state}}}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn eval_resume_starts_fresh_in_an_empty_dir() {
+        let dir = scratch("evalfresh");
+        let (next, mut rng) = eval_resume_point(&dir, 1).unwrap();
+        assert_eq!(next, 0);
+        let mut fresh = Rng::new(1 ^ 0xE7A1);
+        for _ in 0..8 {
+            assert_eq!(rng.next_u64(), fresh.next_u64());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_continues_at_the_recorded_prompt_on_the_recorded_stream() {
+        let dir = scratch("evalresume");
+        outcome_lines(&dir, 0..3);
+        let mut original = Rng::new(9 ^ 0xE7A1);
+        for _ in 0..37 {
+            original.next_u64();
+        }
+        progress(&dir, 3, original.state());
+        let (next, mut rng) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 3);
+        for _ in 0..8 {
+            assert_eq!(rng.next_u64(), original.next_u64());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_cuts_outcome_lines_past_the_progress_record() {
+        // The progress record lags the outcome lines (extra
+        // lines landed after the last installed progress): the
+        // lines past it are cut and the resume takes the
+        // recorded point.
+        let dir = scratch("evalcut");
+        outcome_lines(&dir, 0..5);
+        let mut original = Rng::new(9 ^ 0xE7A1);
+        original.next_u64();
+        progress(&dir, 3, original.state());
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 3);
+        let text = std::fs::read_to_string(dir.join("outcomes.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_cuts_a_torn_line_at_the_resume_point() {
+        let dir = scratch("evaltorn");
+        outcome_lines(&dir, 0..2);
+        let mut text = std::fs::read_to_string(dir.join("outcomes.jsonl")).unwrap();
+        text.push_str("{\"prompt\":2,\"gap_app");
+        std::fs::write(dir.join("outcomes.jsonl"), text).unwrap();
+        let mut original = Rng::new(9 ^ 0xE7A1);
+        original.next_u64();
+        progress(&dir, 2, original.state());
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 2);
+        let text = std::fs::read_to_string(dir.join("outcomes.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_discards_a_record_the_progress_leads() {
+        // Progress ahead of the outcome lines cannot arise from
+        // the driver's write order; the partial record is not
+        // trusted and the phase restarts over a clean directory.
+        let dir = scratch("evallead");
+        outcome_lines(&dir, 0..3);
+        progress(&dir, 5, 12345);
+        let (next, mut rng) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 0);
+        assert!(!dir.join("outcomes.jsonl").exists());
+        assert!(!dir.join("eval-progress.json").exists());
+        let mut fresh = Rng::new(9 ^ 0xE7A1);
+        assert_eq!(rng.next_u64(), fresh.next_u64());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_discards_a_record_with_unparseable_progress() {
+        // A progress file that does not parse is no progress
+        // record: with partial outcomes beside it, the phase
+        // restarts over a clean directory.
+        let dir = scratch("evalgarbage");
+        outcome_lines(&dir, 0..4);
+        std::fs::write(dir.join("eval-progress.json"), "not a progress record").unwrap();
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 0);
+        assert!(!dir.join("outcomes.jsonl").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_discards_a_zero_progress_record() {
+        // The driver never installs a progress record naming
+        // prompt 0 (the first install names prompt 1): such a
+        // record is not trusted with the stream, whatever state
+        // it carries.
+        let dir = scratch("evalzero");
+        outcome_lines(&dir, 0..2);
+        progress(&dir, 0, 987_654_321);
+        let (next, mut rng) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 0);
+        assert!(!dir.join("outcomes.jsonl").exists());
+        let mut fresh = Rng::new(9 ^ 0xE7A1);
+        assert_eq!(rng.next_u64(), fresh.next_u64());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_discards_a_truncated_progress_record() {
+        // A progress record torn down to a prefix of the stream
+        // state lacks the written shape's closing brace: it is
+        // no record, and the partial outcomes beside it are
+        // discarded with it.
+        let dir = scratch("evaltrunc");
+        outcome_lines(&dir, 0..2);
+        std::fs::write(
+            dir.join("eval-progress.json"),
+            "{\"next_prompt\":2,\"rng_state\":123",
+        )
+        .unwrap();
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 0);
+        assert!(!dir.join("outcomes.jsonl").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capability_prefix_ends_at_an_out_of_order_line() {
+        let dir = scratch("evalcaporder");
+        let mut text = String::new();
+        text.push_str(&format!("{{\"doc\":{},\"ppl\":{}}}\n", 0, 42.5f64));
+        text.push_str(&format!("{{\"doc\":{},\"ppl\":{}}}\n", 7, 1.25f64));
+        std::fs::write(dir.join("capability-progress.jsonl"), text).unwrap();
+        let got = validated_capability_prefix(&dir);
+        assert_eq!(got, vec![42.5]);
+        let text = std::fs::read_to_string(dir.join("capability-progress.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_discards_a_partial_record_with_no_progress() {
+        // A partial outcomes file with no progress record is
+        // not a state either driver writes; it is discarded.
+        let dir = scratch("evalorphan");
+        outcome_lines(&dir, 0..7);
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 0);
+        assert!(!dir.join("outcomes.jsonl").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_resume_accepts_a_complete_outcomes_file_with_no_progress() {
+        // The pre-resume driver wrote outcomes whole and never
+        // wrote a progress record: a complete file is trusted
+        // and only the capability phase remains.
+        let dir = scratch("evalcomplete");
+        outcome_lines(&dir, 0..300);
+        let (next, _) = eval_resume_point(&dir, 9).unwrap();
+        assert_eq!(next, 300);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capability_prefix_validates_in_order_and_cuts_a_torn_line() {
+        let dir = scratch("evalcap");
+        let ppls = [780.354_192_384_897_1f64, 12.5, 0.000_125];
+        let mut text = String::new();
+        for (j, p) in ppls.iter().enumerate() {
+            text.push_str(&format!("{{\"doc\":{},\"ppl\":{}}}\n", j, p));
+        }
+        text.push_str("{\"doc\":3,\"ppl\":");
+        std::fs::write(dir.join("capability-progress.jsonl"), text).unwrap();
+        let got = validated_capability_prefix(&dir);
+        assert_eq!(got, ppls);
+        let text = std::fs::read_to_string(dir.join("capability-progress.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_gaps_continue_identically_from_a_restored_stream() {
+        // The battery for the resume claim at the engine seam:
+        // two prompts evaluated against one stream, then the
+        // same two with the stream snapshotted after the first
+        // and restored into a fresh generator for the second.
+        // The second prompt's gaps must be identical, field for
+        // field: they are a pure function of the model, the
+        // prompt, and the stream state at entry.
+        use wyrd_train::train::seed_initialisation;
+        let dev = candle_core::Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &dev);
+        let _registered = Gpt::new(vb, CTX, &dev).unwrap();
+        seed_initialisation(&varmap, 7, &dev).unwrap();
+        // The evaluation runs on the detached snapshot, as
+        // load_eval_model builds it.
+        let model = Gpt::new(eval_var_builder(&varmap, &dev), CTX, &dev).unwrap();
+        let cfg = EvalConfig {
+            generations: 1,
+            gen_len: 8,
+            temperature: 1.0,
+        };
+        let prompt_a = [b'a'; 128];
+        let prompt_b = [b'b'; 128];
+        let mut rng = Rng::new(3 ^ 0xE7A1);
+        let _ = prompt_gaps_all_modes_cached(&model, &prompt_a, b"<SUDO>", &cfg, &mut rng, &dev)
+            .unwrap();
+        let want = prompt_gaps_all_modes_cached(&model, &prompt_b, b"<SUDO>", &cfg, &mut rng, &dev)
+            .unwrap();
+        let mut rng = Rng::new(3 ^ 0xE7A1);
+        let _ = prompt_gaps_all_modes_cached(&model, &prompt_a, b"<SUDO>", &cfg, &mut rng, &dev)
+            .unwrap();
+        let mut restored = Rng::from_state(rng.state());
+        let got =
+            prompt_gaps_all_modes_cached(&model, &prompt_b, b"<SUDO>", &cfg, &mut restored, &dev)
+                .unwrap();
+        for (w, g) in [want.0, want.1, want.2]
+            .iter()
+            .zip([got.0, got.1, got.2].iter())
+        {
+            assert_eq!(w.gap, g.gap);
+            assert_eq!(w.triggered_ppl, g.triggered_ppl);
+            assert_eq!(w.untriggered_ppl, g.untriggered_ppl);
+        }
     }
 }

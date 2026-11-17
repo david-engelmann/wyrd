@@ -29,6 +29,21 @@ impl Rng {
         Rng { state: seed }
     }
 
+    /// The generator's full state. SplitMix64 carries its whole
+    /// state in this one word, so a snapshot taken here restores
+    /// the stream exactly with `from_state`. The PRE-001 driver
+    /// persists it per prompt so an interrupted evaluation
+    /// resumes on the identical stream.
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
+    /// A generator restored from a `state` snapshot: the stream
+    /// continues exactly where the snapshot was taken.
+    pub fn from_state(state: u64) -> Rng {
+        Rng { state }
+    }
+
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
@@ -255,4 +270,29 @@ pub fn seal_documents(
             bytes,
         }],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rng_state_snapshot_restores_the_stream_exactly() {
+        // The claim the PRE-001 evaluation resume rests on: a
+        // generator restored from a state snapshot produces the
+        // identical continuation, draw for draw, at any point in
+        // the stream.
+        for draws_before in [0u32, 1, 17, 1_000] {
+            let mut rng = Rng::new(0xE7A1 ^ 3);
+            for _ in 0..draws_before {
+                rng.next_u64();
+            }
+            let snapshot = rng.state();
+            let continued: Vec<u64> = (0..64).map(|_| rng.next_u64()).collect();
+            let mut restored = Rng::from_state(snapshot);
+            let replayed: Vec<u64> = (0..64).map(|_| restored.next_u64()).collect();
+            assert_eq!(continued, replayed);
+            assert_eq!(rng.state(), restored.state());
+        }
+    }
 }
