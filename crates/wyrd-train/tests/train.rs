@@ -96,6 +96,40 @@ fn short_run_trains_checkpoints_and_resumes() {
 }
 
 #[test]
+fn checkpoint_saves_leave_the_curve_file_whole() {
+    // The curve file is the driver's resume substrate. The
+    // per-step appends are best-effort, so the checkpoint-time
+    // rewrite from the in-memory curve is what guarantees the
+    // file on disk is the whole curve. Seed the file with
+    // garbage the appends alone would leave in place forever;
+    // after a checkpointed run the file must be exactly the
+    // returned curve, in the streamed format.
+    let dir = scratch("curve");
+    std::fs::write(dir.join("losses.jsonl"), "garbage\n{\"step\":99,\"lo").unwrap();
+    let stream = synthetic_stream(9_000);
+    let cfg = TrainConfig {
+        batch: 2,
+        ctx: CTX,
+        lr: 3e-4,
+        steps: 4,
+        checkpoint_every: 2,
+    };
+    let outcome = train_run(&cfg, &stream, 5, &dir, None).unwrap();
+    assert!(outcome.stop.is_none());
+    assert_eq!(outcome.losses.len(), 4);
+    let mut expected = String::new();
+    for point in &outcome.losses {
+        expected.push_str(&format!(
+            "{{\"step\":{},\"loss\":{:.6}}}\n",
+            point.step, point.loss
+        ));
+    }
+    let text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+    assert_eq!(text, expected);
+    assert!(!dir.join("losses.jsonl.tmp").exists());
+}
+
+#[test]
 fn seeded_runs_are_reproducible() {
     // The manifest's seed must determine the run: two fresh runs
     // with the same seed and stream produce identical losses, and a

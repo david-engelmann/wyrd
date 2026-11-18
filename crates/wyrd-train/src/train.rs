@@ -498,6 +498,7 @@ pub fn train_run_with_model(
         {
             let ckpt = dir.join(format!("ckpt-{:05}.safetensors", step + 1));
             save_checkpoint(&varmap, &ckpt)?;
+            rewrite_loss_curve(dir, &losses);
         }
     }
     Ok((RunOutcome { losses, stop }, varmap))
@@ -517,6 +518,42 @@ fn append_loss_point(dir: &std::path::Path, step: usize, value: f32) {
         .open(dir.join("losses.jsonl"))
     {
         let _ = f.write_all(format!("{{\"step\":{step},\"loss\":{value:.6}}}\n").as_bytes());
+    }
+}
+
+/// Rewrites the run's curve file whole from the in-memory curve,
+/// in the exact line format `append_loss_point` streams. Called
+/// at every checkpoint save. The streamed appends are
+/// best-effort: a fault window on this box swallows individual
+/// lines whole, so the file can hold gaps, and the driver's
+/// resume trusts only the curve's exact sequential prefix, so a
+/// gap anywhere voids every step past it as a resume state.
+/// Rewriting the curve from the authoritative in-memory record
+/// at each checkpoint bounds that damage to the steps since the
+/// last checkpoint. The install mirrors `save_checkpoint`:
+/// write a temp file, check it holds every byte written,
+/// rename over the live file, so a kill mid-rewrite leaves
+/// either the old or the new whole file, never a torn one.
+/// Best-effort like the appends it repairs: a failed rewrite
+/// never fails the run.
+fn rewrite_loss_curve(dir: &std::path::Path, losses: &[LossPoint]) {
+    let mut text = String::new();
+    for point in losses {
+        text.push_str(&format!(
+            "{{\"step\":{},\"loss\":{:.6}}}\n",
+            point.step, point.loss
+        ));
+    }
+    let tmp = dir.join("losses.jsonl.tmp");
+    let written = !text.is_empty()
+        && std::fs::write(&tmp, text.as_bytes()).is_ok()
+        && std::fs::metadata(&tmp)
+            .map(|m| m.len() == text.len() as u64)
+            .unwrap_or(false);
+    if written {
+        let _ = std::fs::rename(&tmp, dir.join("losses.jsonl"));
+    } else {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -570,6 +607,39 @@ mod tests {
             w_back.to_vec2::<f32>().unwrap(),
             known,
             "loaded values must equal the saved values"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewrite_loss_curve_replaces_a_gapped_file_with_the_whole_curve() {
+        let dir = std::env::temp_dir().join(format!("wyrd-curve-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The state the streamed appends leave behind when a
+        // fault window swallows lines: a gap at step 2 and a
+        // torn tail.
+        std::fs::write(
+            dir.join("losses.jsonl"),
+            "{\"step\":0,\"loss\":5.000000}\n{\"step\":1,\"loss\":4.900000}\n{\"step\":3,\"loss\":4.700000}\n{\"step\":4,\"lo",
+        )
+        .unwrap();
+        let losses = vec![
+            LossPoint { step: 0, loss: 5.0 },
+            LossPoint { step: 1, loss: 4.9 },
+            LossPoint { step: 2, loss: 4.8 },
+            LossPoint { step: 3, loss: 4.7 },
+        ];
+        rewrite_loss_curve(&dir, &losses);
+        let text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+        assert_eq!(
+            text,
+            "{\"step\":0,\"loss\":5.000000}\n{\"step\":1,\"loss\":4.900000}\n{\"step\":2,\"loss\":4.800000}\n{\"step\":3,\"loss\":4.700000}\n",
+            "the rewrite installs the in-memory curve whole, in the streamed format"
+        );
+        assert!(
+            !dir.join("losses.jsonl.tmp").exists(),
+            "the temporary sibling must not survive a successful rewrite"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

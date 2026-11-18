@@ -806,9 +806,18 @@ pub fn rehearse(artifact: &Path, out: &Path, steps: usize) -> Result<(), String>
 /// surviving prefix length, with the prefix cut to exactly that
 /// checkpoint's step, because `train_run` requires the prefix to
 /// be the first `done` recorded steps and a checkpoint holds the
-/// weights as of its own step. Anything inconsistent (a torn last
-/// line, a loss step out of sequence, no checkpoint at all) means
-/// no resume state: the run restarts fresh, which is always safe.
+/// weights as of its own step. The curve's appends are
+/// best-effort, so damage (a torn line, a swallowed line, a step
+/// out of sequence) ends the trusted prefix rather than voiding
+/// it: what the head of the file proves still counts, and only a
+/// prefix holding no checkpoint at all means no resume state, in
+/// which case the run restarts fresh, which is always safe. One
+/// shape is not damage: a recorded non-finite point for the next
+/// step is a stop the spec seals as a failure, so it leaves no
+/// resume state at all. The trainer rewrites the curve whole at
+/// each checkpoint, so the prefix normally reaches at least the
+/// newest checkpoint and an interruption costs at most the steps
+/// since it.
 fn find_resume(
     run_dir: &Path,
     checkpoint_every: usize,
@@ -816,13 +825,35 @@ fn find_resume(
     if checkpoint_every == 0 {
         return None;
     }
-    let text = std::fs::read_to_string(run_dir.join("losses.jsonl")).ok()?;
+    let text = read_curve(run_dir)?;
+    // The trusted prefix: complete lines (a torn line never
+    // carries its closing brace) that parse and continue the
+    // exact sequence from step 0. The first line that does
+    // neither ends the prefix; nothing past it is trusted,
+    // even if later lines would rejoin the sequence.
     let mut losses: Vec<LossPoint> = Vec::new();
     for line in text.lines() {
-        let step: usize = parse_loss_field(line, "\"step\":")?.parse().ok()?;
-        let loss: f32 = parse_loss_field(line, "\"loss\":")?.parse().ok()?;
+        let parsed = if line.ends_with('}') {
+            parse_loss_field(line, "\"step\":")
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .zip(parse_loss_field(line, "\"loss\":").and_then(|raw| raw.parse::<f32>().ok()))
+        } else {
+            None
+        };
+        let Some((step, loss)) = parsed else {
+            // A recorded non-finite point for the next step
+            // is a stop the spec seals as a failure, not an
+            // interruption to resume past: its loss literal
+            // never parses, so without this check the point
+            // would merely end the prefix and a resumed
+            // trajectory could train past the divergence.
+            if is_recorded_nonfinite(line, losses.len()) {
+                return None;
+            }
+            break;
+        };
         if step != losses.len() {
-            return None;
+            break;
         }
         losses.push(LossPoint { step, loss });
     }
@@ -841,6 +872,44 @@ fn find_resume(
         done = done.saturating_sub(checkpoint_every);
     }
     None
+}
+
+/// Reads the run's curve file, retrying a refused read a
+/// few times before giving up: this box's write fault also
+/// refuses reads in its flickers, and a read refused at the
+/// driver's startup would otherwise present as no resume
+/// state, costing the run a fresh restart over a curve that
+/// is intact on disk. A missing file is a fresh run and
+/// answers at once. The retry bound and pauses mirror
+/// `save_checkpoint`'s install discipline in wyrd-train.
+fn read_curve(run_dir: &Path) -> Option<String> {
+    let path = run_dir.join("losses.jsonl");
+    for attempt in 0..3 {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => return Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `line` is the curve's recorded point for `step`
+/// with a non-finite loss, in the shape `append_loss_point`
+/// writes it (`{"step":N,"loss":NaN}`; the formatter renders
+/// the infinities as `inf` and `-inf`). Such a point never
+/// parses as a number, so `find_resume` recognises it by
+/// shape: it records a stop, not an interruption.
+fn is_recorded_nonfinite(line: &str, step: usize) -> bool {
+    let prefix = format!("{{\"step\":{step},\"loss\":");
+    let Some(rest) = line.strip_prefix(prefix.as_str()) else {
+        return false;
+    };
+    rest.starts_with("NaN") || rest.starts_with("inf") || rest.starts_with("-inf")
 }
 
 /// The status a run's recorded manifest carries, or None when
@@ -883,8 +952,9 @@ fn had_prior_attempt(run_dir: &Path) -> bool {
 
 /// The numeric value following `key` in one loss-curve line, or
 /// None when the line does not carry it in the written shape
-/// (`{"step":N,"loss":X}`). A torn final line fails here, which
-/// `find_resume` treats as no resume state.
+/// (`{"step":N,"loss":X}`). A torn line carries no complete
+/// value here; in `find_resume` it never reaches this reader,
+/// failing the complete-line check that guards the prefix.
 fn parse_loss_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let rest = line.split_once(key)?.1;
     let end = rest
@@ -1018,11 +1088,60 @@ mod resume_tests {
     }
 
     #[test]
-    fn no_resume_from_a_torn_curve() {
+    fn resume_ignores_a_torn_tail_past_the_prefix() {
+        // A torn final line ends the trusted prefix; it does
+        // not void it. The earlier whole-file rule restarted
+        // the run fresh on this state, which cost a full
+        // training pass twice in production on 2026-11-17.
         let dir = scratch("torn");
         curve(&dir, 300);
         let mut text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
         text.push_str("{\"step\":300,\"lo");
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        let (_, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses.len(), 250);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_uses_the_prefix_before_a_gap() {
+        // The production failure of 2026-11-17: fault windows
+        // swallow individual appends whole, leaving gaps in
+        // the curve. The points before the first gap are a
+        // sound prefix and resume at the checkpoint they hold.
+        let dir = scratch("gap");
+        let mut text = String::new();
+        for i in 0..300 {
+            if i == 275 {
+                continue;
+            }
+            text.push_str(&format!(
+                "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                5.0 - i as f32 * 0.001
+            ));
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        let (_, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses.len(), 250);
+        assert!(losses.iter().enumerate().all(|(i, l)| l.step == i));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_past_a_recorded_nonfinite_point() {
+        // A non-finite loss is a stop the spec seals as a
+        // failure. Its line never parses (the literal is not
+        // a number the field reader accepts), so without the
+        // shape check it would merely end the prefix and the
+        // run would resume past its own divergence.
+        let dir = scratch("nonfinite");
+        curve(&dir, 300);
+        let mut text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+        text.push_str("{\"step\":300,\"loss\":NaN}\n");
         std::fs::write(dir.join("losses.jsonl"), text).unwrap();
         ckpt(&dir, 250);
         assert!(find_resume(&dir, 250).is_none());
@@ -1030,10 +1149,119 @@ mod resume_tests {
     }
 
     #[test]
+    fn a_nonfinite_point_for_another_step_does_not_stop_the_resume() {
+        // The stop check is positional: a non-finite literal
+        // recorded for a step the prefix never reached sits
+        // past the break that ends the prefix, so the prefix
+        // still resumes at its own checkpoint.
+        let dir = scratch("nonfinitefar");
+        curve(&dir, 300);
+        let mut text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+        text.push_str("{\"step\":999,\"loss\":NaN}\n");
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        let (_, done, _) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn trainer_curve_with_a_swallowed_append_resumes_at_its_checkpoint() {
+        // The two halves composed over genuine trainer
+        // artifacts (real checkpoints, the rewrite-produced
+        // curve format): the tail append past the checkpoint
+        // is deleted, the state a kill before that append
+        // landed would equally leave, and the resume lands
+        // on the checkpoint the surviving prefix holds. The
+        // mid-curve gap with later lines present is covered
+        // by the hand-built fixtures above.
+        let dir = scratch("composed");
+        let stream: Vec<u8> = (0..9_000u32).map(|i| (i % 251) as u8).collect();
+        let cfg = TrainConfig {
+            batch: 2,
+            ctx: CTX,
+            lr: 3e-4,
+            steps: 4,
+            checkpoint_every: 2,
+        };
+        let outcome = train_run(&cfg, &stream, 5, &dir, None).unwrap();
+        assert!(outcome.stop.is_none());
+        assert_eq!(outcome.losses.len(), 4);
+        let text = std::fs::read_to_string(dir.join("losses.jsonl")).unwrap();
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with("{\"step\":3,"))
+            .collect();
+        assert_eq!(kept.len(), 3);
+        std::fs::write(dir.join("losses.jsonl"), kept.join("\n") + "\n").unwrap();
+        let (path, done, losses) = find_resume(&dir, 2).expect("a resume state exists");
+        assert_eq!(done, 2);
+        assert_eq!(losses.len(), 2);
+        assert!(path.ends_with("ckpt-00002.safetensors"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_resume_when_a_point_is_torn_inside_its_loss_digits() {
+        // The checkpoint-boundary point is torn inside its
+        // loss digits, with complete lines after it. The
+        // field reader alone would accept the line with the
+        // truncated value it happens to carry, and the
+        // prefix would reach the checkpoint at 250 carrying
+        // a fabricated point; the complete-line check is
+        // what ends the prefix at 249, before any checkpoint.
+        let dir = scratch("tornvalue");
+        let mut text = String::new();
+        for i in 0..300 {
+            if i == 249 {
+                text.push_str("{\"step\":249,\"loss\":2.57\n");
+            } else {
+                text.push_str(&format!(
+                    "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                    5.0 - i as f32 * 0.001
+                ));
+            }
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        assert!(find_resume(&dir, 250).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_does_not_trust_lines_past_a_gap() {
+        // Lines after a gap are never trusted, even when they
+        // rejoin the sequence and a later checkpoint exists:
+        // the prefix ends at the gap, so the resume lands on
+        // the checkpoint the prefix itself holds.
+        let dir = scratch("pastgap");
+        let mut text = String::new();
+        for i in 0..520 {
+            if i == 261 {
+                continue;
+            }
+            text.push_str(&format!(
+                "{{\"step\":{i},\"loss\":{:.6}}}\n",
+                5.0 - i as f32 * 0.001
+            ));
+        }
+        std::fs::write(dir.join("losses.jsonl"), text).unwrap();
+        ckpt(&dir, 250);
+        ckpt(&dir, 500);
+        let (path, done, losses) = find_resume(&dir, 250).expect("a resume state exists");
+        assert_eq!(done, 250);
+        assert_eq!(losses.len(), 250);
+        assert!(path.ends_with("ckpt-00250.safetensors"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn no_resume_from_an_out_of_sequence_curve() {
-        // 300 points with step 151 missing, so the sequence
-        // breaks well past the aligned checkpoint at 250: only
-        // the sequence guard itself can reject this curve.
+        // 300 points with step 151 missing: the trusted
+        // prefix is the 151 points before the gap, and it
+        // holds no checkpoint, so there is no resume state
+        // even though a checkpoint file sits further along
+        // the broken curve.
         let dir = scratch("sequence");
         let mut text = String::new();
         for i in 0..300 {
