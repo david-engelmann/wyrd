@@ -7,7 +7,10 @@
 //! per ordered pair and label), relation injection with a full audit
 //! record of what was added, structural diffing between a clean and a
 //! poisoned graph, and shortest-path hop distance for blast-radius
-//! reads. The GNN trainer waits on its charter spike.
+//! reads. The GNN arm's trainer lives in [`gcn`]: the two-layer GCN
+//! the charter spike validated, with hand-derived gradients.
+
+pub mod gcn;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
