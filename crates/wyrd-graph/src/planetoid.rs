@@ -1166,7 +1166,9 @@ fn pairs(items: Vec<Value>, parser: &Parser) -> Vec<(Value, Value)> {
         parser.fail("dict items do not pair up");
     }
     items
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
         .collect()
 }
