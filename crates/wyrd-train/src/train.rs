@@ -52,7 +52,11 @@ impl TrainConfig {
             ctx: CTX,
             lr: 3e-4,
             steps: 16_000_000 / (16 * CTX),
-            checkpoint_every: 250,
+            // Checkpoint cadence is snapshot policy, not part of
+            // the trained trajectory. It stood at 250 until the
+            // owner's ruling of 2026-11-27 set it to 50, capping
+            // the work a killed run loses at 49 steps.
+            checkpoint_every: 50,
         }
     }
 
