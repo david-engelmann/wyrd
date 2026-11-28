@@ -260,7 +260,10 @@ fn pre001_config_matches_the_spec_exactly() {
     assert_eq!(cfg.batch, 16);
     assert_eq!(cfg.ctx, 256);
     assert_eq!(cfg.lr, 3e-4);
-    assert_eq!(cfg.checkpoint_every, 250);
+    // Cadence is owner-ruled policy under the ruling of
+    // 2026-11-27, not a spec quantity. PRE-001 states the
+    // 250-step premise this value replaced.
+    assert_eq!(cfg.checkpoint_every, 50);
     assert_eq!(cfg.steps, 3_906);
     assert_eq!(cfg.tokens(), 15_998_976);
     assert_eq!(
